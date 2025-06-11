@@ -15,18 +15,14 @@
 
 using namespace std;
 
-// TCP 연결 식별 키
 struct ConnectionKey {
     Ip src_ip, dst_ip;
     uint16_t src_port, dst_port;
-
     bool operator<(const ConnectionKey& o) const {
-        return tie(src_ip, dst_ip, src_port, dst_port) <
-               tie(o.src_ip, o.dst_ip, o.src_port, o.dst_port);
+        return tie(src_ip, dst_ip, src_port, dst_port) < tie(o.src_ip, o.dst_ip, o.src_port, o.dst_port);
     }
 };
 
-// 재조합 상태 저장
 struct ReassemblyContext {
     vector<uint8_t> buffer;
     uint16_t expected_length = 0;
@@ -37,7 +33,6 @@ struct ReassemblyContext {
 
 map<ConnectionKey, ReassemblyContext> session_manager;
 
-// 체크섬 계산
 uint16_t calculate_checksum(const void* buf, size_t len) {
     auto* p = static_cast<const uint16_t*>(buf);
     uint32_t sum = 0;
@@ -47,7 +42,6 @@ uint16_t calculate_checksum(const void* buf, size_t len) {
     return htons(~sum);
 }
 
-// 가상 TCP 헤더
 #pragma pack(push, 1)
 struct PseudoHdr {
     uint32_t src_ip, dst_ip;
@@ -56,7 +50,6 @@ struct PseudoHdr {
 };
 #pragma pack(pop)
 
-// RST 패킷 양방향 전송
 void send_rst_both(pcap_t* handle, const ReassemblyContext& ctx, const Mac& my_mac) {
     auto send_one = [&](IpHdr ip, TcpHdr tcp, Mac dmac, Mac smac) {
         vector<uint8_t> packet(sizeof(EthHdr) + sizeof(IpHdr) + sizeof(TcpHdr));
@@ -86,13 +79,11 @@ void send_rst_both(pcap_t* handle, const ReassemblyContext& ctx, const Mac& my_m
         pcap_sendpacket(handle, packet.data(), packet.size());
     };
 
-    // 정방향
     IpHdr ip_fwd = ctx.ip_hdr;
     TcpHdr tcp_fwd = ctx.tcp_hdr;
     tcp_fwd.th_seq = htonl(ntohl(tcp_fwd.th_seq) + ctx.buffer.size());
     send_one(ip_fwd, tcp_fwd, ctx.eth_hdr.smac(), my_mac);
 
-    // 역방향
     IpHdr ip_back = ctx.ip_hdr;
     TcpHdr tcp_back = ctx.tcp_hdr;
     swap(ip_back.sip_, ip_back.dip_);
@@ -102,7 +93,6 @@ void send_rst_both(pcap_t* handle, const ReassemblyContext& ctx, const Mac& my_m
     send_one(ip_back, tcp_back, ctx.eth_hdr.dmac(), ctx.eth_hdr.smac());
 }
 
-// TLS SNI 파싱 개선 버전
 string find_sni_from_tls(const vector<uint8_t>& data) {
     size_t pos = 0;
     if (data.size() < 5) return "";
@@ -124,7 +114,7 @@ string find_sni_from_tls(const vector<uint8_t>& data) {
         pos += 4;
         if (ext_type == 0x0000 && pos + 5 <= data.size()) {
             pos += 2;
-            uint8_t name_type = data[pos++];
+            pos++; // name_type
             uint16_t name_len = ntohs(*(uint16_t*)(&data[pos]));
             pos += 2;
             if (pos + name_len <= data.size())
@@ -137,7 +127,7 @@ string find_sni_from_tls(const vector<uint8_t>& data) {
 
 void usage() {
     cout << "syntax: ./tls-block <interface> <host>\n";
-    cout << "sample: ./tls-block wlan0 naver.com\n";
+    cout << "sample: ./tls-block eth0 naver.com\n";
 }
 
 int main(int argc, char* argv[]) {
@@ -157,8 +147,6 @@ int main(int argc, char* argv[]) {
         cerr << "pcap_open_live error: " << errbuf << endl;
         return -1;
     }
-
-    cout << "[*] Monitoring interface " << iface << " for host: " << target_host << endl;
 
     while (true) {
         pcap_pkthdr* header;
@@ -198,8 +186,10 @@ int main(int argc, char* argv[]) {
             string sni = find_sni_from_tls(ctx.buffer);
             if (!sni.empty()) {
                 cout << "[*] SNI detected: " << sni << endl;
-                if (sni.find(target_host) != string::npos) {
-                    cout << "[!] Match found, sending RST packets...\n";
+                if (sni == target_host ||
+                    (sni.size() > target_host.size() &&
+                     sni.compare(sni.size() - target_host.size(), target_host.size(), target_host) == 0)) {
+                    cout << "[!] Match found. Sending RST packets..." << endl;
                     send_rst_both(handle, ctx, my_mac);
                 }
             }
