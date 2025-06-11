@@ -4,28 +4,34 @@
 #include <netinet/ether.h>
 #include <arpa/inet.h>
 #include <unistd.h>
-#include <cstring>
+#include <string.h>
 #include <iostream>
+#include <vector>
+#include <queue>
+#include <mutex>
+#include <condition_variable>
+#include <thread>
+#include <atomic>
 
 using namespace std;
 
-const int BUF_SIZE = 4096;
+#define ETHERNET_SIZE 14
 
 void usage() {
-    cout << "Usage: ./tls-block <interface> <server name>\n";
+    cout << "syntax : tls-block <interface> <server name>\n";
+    cout << "sample : tls-block wlan0 naver.com\n";
 }
 
-uint16_t checksum(uint16_t* buf, int len) {
+uint16_t checksum(uint16_t *buf, int len) {
     uint32_t sum = 0;
     while (len > 1) {
         sum += *buf++;
         len -= 2;
     }
-    if (len == 1)
-        sum += *(uint8_t*)buf;
+    if (len == 1) sum += *(uint8_t *)buf;
     sum = (sum >> 16) + (sum & 0xffff);
     sum += (sum >> 16);
-    return static_cast<uint16_t>(~sum);
+    return (uint16_t)(~sum);
 }
 
 struct PseudoHeader {
@@ -36,147 +42,199 @@ struct PseudoHeader {
     uint16_t len;
 };
 
-// --- TLS Client Hello 내 SNI 파싱 --- //
-string get_sni_from_packet(const u_char* packet, int len) {
-    const ip* ip_hdr = (ip*)(packet + sizeof(ether_header));
-    int ip_hdr_len = ip_hdr->ip_hl * 4;
-    const tcphdr* tcp_hdr = (tcphdr*)((u_char*)ip_hdr + ip_hdr_len);
-    int tcp_hdr_len = tcp_hdr->th_off * 4;
-    const u_char* payload = (u_char*)tcp_hdr + tcp_hdr_len;
-    int payload_len = ntohs(ip_hdr->ip_len) - ip_hdr_len - tcp_hdr_len;
+string parse_sni(const u_char *data, int data_len) {
+    int pos = 0;
+    pos += 5;  // TLS record header
+    if (pos >= data_len) return "";
 
-    if (payload_len < 5 || payload[0] != 0x16) return ""; // TLS Handshake
-    int tls_len = (payload[3] << 8) | payload[4];
-    if (tls_len + 5 > payload_len) return "";
+    pos += 4;  // handshake header
+    if (pos >= data_len) return "";
 
-    const u_char* handshake = payload + 5;
-    if (handshake[0] != 0x01) return ""; // Client Hello
-    int session_id_len_offset = 43;
-    if (handshake + session_id_len_offset >= payload + payload_len) return "";
+    pos += 2 + 32;  // version + random
+    if (pos >= data_len) return "";
 
-    int session_id_len = handshake[session_id_len_offset];
-    int cipher_len = (handshake[session_id_len_offset + 1 + session_id_len] << 8) |
-                     handshake[session_id_len_offset + 2 + session_id_len];
-    int comp_method_len = handshake[session_id_len_offset + 3 + session_id_len + cipher_len];
-    int ext_len_offset = session_id_len_offset + 4 + session_id_len + cipher_len + comp_method_len;
-    int ext_len = (handshake[ext_len_offset] << 8) | handshake[ext_len_offset + 1];
+    uint8_t session_id_len = data[pos];
+    pos += 1 + session_id_len;
+    if (pos >= data_len) return "";
 
-    const u_char* ext_ptr = handshake + ext_len_offset + 2;
-    const u_char* ext_end = ext_ptr + ext_len;
-    while (ext_ptr + 4 <= ext_end) {
-        uint16_t ext_type = (ext_ptr[0] << 8) | ext_ptr[1];
-        uint16_t ext_size = (ext_ptr[2] << 8) | ext_ptr[3];
-        if (ext_type == 0x00) { // server_name
-            int sni_len = (ext_ptr[7] << 8) | ext_ptr[8];
-            string sni((char*)(ext_ptr + 9), sni_len);
-            return sni;
+    uint16_t cipher_len = (data[pos] << 8) | data[pos + 1];
+    pos += 2 + cipher_len;
+    if (pos >= data_len) return "";
+
+    uint8_t comp_len = data[pos];
+    pos += 1 + comp_len;
+    if (pos >= data_len) return "";
+
+    uint16_t ext_len = (data[pos] << 8) | data[pos + 1];
+    pos += 2;
+    if (pos >= data_len) return "";
+
+    int ext_end = pos + ext_len;
+    while (pos + 4 <= ext_end) {
+        uint16_t ext_type = (data[pos] << 8) | data[pos + 1];
+        uint16_t ext_len = (data[pos + 2] << 8) | data[pos + 3];
+        pos += 4;
+        if (ext_type == 0x00) {  // SNI
+            if (pos + 5 >= data_len) return "";
+            uint16_t sni_list_len = (data[pos] << 8) | data[pos + 1];
+            uint8_t sni_type = data[pos + 2];
+            uint16_t sni_len = (data[pos + 3] << 8) | data[pos + 4];
+            pos += 5;
+            if (pos + sni_len > data_len) return "";
+            return string((const char *)(data + pos), sni_len);
         }
-        ext_ptr += 4 + ext_size;
+        pos += ext_len;
     }
     return "";
 }
 
-// --- TCP 패킷 전송 함수 --- //
-void inject_tcp(const ip* ip_src, const tcphdr* tcp_src, const char* data, int data_len, uint8_t flags) {
-    char buf[BUF_SIZE] = {};
-    ip* iph = (ip*)buf;
-    tcphdr* tcph = (tcphdr*)(buf + sizeof(ip));
-    char* payload = buf + sizeof(ip) + sizeof(tcphdr);
-
-    if (data && data_len > 0)
-        memcpy(payload, data, data_len);
+void inject_rst(const ip *ip_hdr, const tcphdr *tcp_hdr, bool forward) {
+    char buf[1500] = {};
+    ip *iph = (ip *)buf;
+    tcphdr *tcph = (tcphdr *)(buf + sizeof(ip));
 
     iph->ip_v = 4;
     iph->ip_hl = 5;
     iph->ip_ttl = 64;
     iph->ip_p = IPPROTO_TCP;
-    iph->ip_len = htons(sizeof(ip) + sizeof(tcphdr) + data_len);
+    iph->ip_len = htons(sizeof(ip) + sizeof(tcphdr));
     iph->ip_off = 0;
-    iph->ip_id = htons(12345);
+    iph->ip_id = htons(1234);
 
-    iph->ip_src = (flags & TH_RST) ? ip_src->ip_src : ip_src->ip_dst;
-    iph->ip_dst = (flags & TH_RST) ? ip_src->ip_dst : ip_src->ip_src;
+    iph->ip_src = forward ? ip_hdr->ip_src : ip_hdr->ip_dst;
+    iph->ip_dst = forward ? ip_hdr->ip_dst : ip_hdr->ip_src;
     iph->ip_sum = 0;
-    iph->ip_sum = checksum((uint16_t*)iph, sizeof(ip));
+    iph->ip_sum = checksum((uint16_t *)iph, sizeof(ip));
 
-    tcph->th_sport = (flags & TH_RST) ? tcp_src->th_sport : tcp_src->th_dport;
-    tcph->th_dport = (flags & TH_RST) ? tcp_src->th_dport : tcp_src->th_sport;
+    tcph->th_sport = forward ? tcp_hdr->th_sport : tcp_hdr->th_dport;
+    tcph->th_dport = forward ? tcp_hdr->th_dport : tcp_hdr->th_sport;
 
-    int ip_len = ip_src->ip_hl * 4;
-    int tcp_len = tcp_src->th_off * 4;
-    int orig_data_len = ntohs(ip_src->ip_len) - ip_len - tcp_len;
+    uint32_t seq = ntohl(tcp_hdr->th_seq);
+    uint32_t ack = ntohl(tcp_hdr->th_ack);
+    int ip_hl = ip_hdr->ip_hl * 4;
+    int tcp_hl = tcp_hdr->th_off * 4;
+    int payload_len = ntohs(ip_hdr->ip_len) - ip_hl - tcp_hl;
 
-    tcph->th_seq = htonl((flags & TH_RST) ? ntohl(tcp_src->th_seq) + orig_data_len : ntohl(tcp_src->th_ack));
-    tcph->th_ack = (flags & TH_RST) ? 0 : htonl(ntohl(tcp_src->th_seq) + orig_data_len);
+    tcph->th_seq = htonl(forward ? seq + payload_len : ack);
+    tcph->th_ack = forward ? 0 : htonl(seq + payload_len);
     tcph->th_off = 5;
-    tcph->th_flags = flags;
+    tcph->th_flags = TH_RST | (forward ? 0 : TH_ACK);
     tcph->th_win = htons(65535);
-    tcph->th_sum = 0;
 
     PseudoHeader pseudo;
     pseudo.src = iph->ip_src.s_addr;
     pseudo.dst = iph->ip_dst.s_addr;
-    pseudo.len = htons(sizeof(tcphdr) + data_len);
+    pseudo.len = htons(sizeof(tcphdr));
 
-    char pseudo_buf[BUF_SIZE] = {};
+    char pseudo_buf[1500] = {};
     memcpy(pseudo_buf, &pseudo, sizeof(pseudo));
-    memcpy(pseudo_buf + sizeof(pseudo), tcph, sizeof(tcphdr) + data_len);
-    tcph->th_sum = checksum((uint16_t*)pseudo_buf, sizeof(pseudo) + sizeof(tcphdr) + data_len);
+    memcpy(pseudo_buf + sizeof(pseudo), tcph, sizeof(tcphdr));
+    tcph->th_sum = checksum((uint16_t *)pseudo_buf, sizeof(pseudo) + sizeof(tcphdr));
 
     int sock = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
     if (sock < 0) {
-        perror("raw socket");
-        return;
+        perror("socket"); return;
     }
+    int one = 1;
+    setsockopt(sock, IPPROTO_IP, IP_HDRINCL, &one, sizeof(one));
 
-    int on = 1;
-    setsockopt(sock, IPPROTO_IP, IP_HDRINCL, &on, sizeof(on));
-
-    sockaddr_in to;
-    memset(&to, 0, sizeof(to));
+    sockaddr_in to = {};
     to.sin_family = AF_INET;
     to.sin_addr = iph->ip_dst;
-
-    sendto(sock, buf, sizeof(ip) + sizeof(tcphdr) + data_len, 0, (sockaddr*)&to, sizeof(to));
+    sendto(sock, buf, sizeof(ip) + sizeof(tcphdr), 0, (sockaddr *)&to, sizeof(to));
     close(sock);
 }
 
-// --- Main --- //
-int main(int argc, char* argv[]) {
+// --------------------- Thread-safe Queue Section --------------------------
+
+struct Packet {
+    pcap_pkthdr *hdr;
+    const u_char *data;
+};
+
+queue<Packet> packet_queue;
+mutex queue_mutex;
+condition_variable queue_cv;
+atomic<bool> running(true);
+
+// --------------------- Packet Processing Thread ---------------------------
+
+void packet_processor(const string &target_name) {
+    while (running) {
+        unique_lock<mutex> lock(queue_mutex);
+        queue_cv.wait(lock, [] { return !packet_queue.empty() || !running; });
+
+        if (!running && packet_queue.empty()) break;
+
+        Packet pkt = packet_queue.front();
+        packet_queue.pop();
+        lock.unlock();
+
+        const ip *ip_hdr = (ip *)(pkt.data + ETHERNET_SIZE);
+        if (ip_hdr->ip_p != IPPROTO_TCP) continue;
+
+        int ip_hdr_len = ip_hdr->ip_hl * 4;
+        const tcphdr *tcp_hdr = (tcphdr *)((u_char *)ip_hdr + ip_hdr_len);
+        int tcp_hdr_len = tcp_hdr->th_off * 4;
+        int payload_len = ntohs(ip_hdr->ip_len) - ip_hdr_len - tcp_hdr_len;
+        if (payload_len <= 0) continue;
+
+        const u_char *payload = (u_char *)tcp_hdr + tcp_hdr_len;
+        string server_name = parse_sni(payload, payload_len);
+
+        if (!server_name.empty()) {
+            cout << "[*] Detected SNI: " << server_name << endl;
+            if (server_name == target_name) {
+                cout << "[!] Match found! Blocking..." << endl;
+                inject_rst(ip_hdr, tcp_hdr, true);
+                inject_rst(ip_hdr, tcp_hdr, false);
+            }
+        }
+    }
+}
+
+// --------------------- Main Function --------------------------------------
+
+int main(int argc, char *argv[]) {
     if (argc != 3) {
         usage();
         return 1;
     }
 
-    string block_name = argv[2];
+    string iface = argv[1];
+    string target_name = argv[2];
+
     char errbuf[PCAP_ERRBUF_SIZE];
-    pcap_t* handle = pcap_open_live(argv[1], BUFSIZ, 1, 10, errbuf);
+    pcap_t *handle = pcap_open_live(iface.c_str(), BUFSIZ, 1, 10, errbuf);
     if (!handle) {
-        cerr << "pcap_open_live failed: " << errbuf << endl;
+        cerr << "pcap_open_live error: " << errbuf << endl;
         return 1;
     }
 
-    cout << "[*] Monitoring interface: " << argv[1] << " for SNI: " << block_name << endl;
+    cout << "[*] Monitoring interface: " << iface << " for SNI: " << target_name << endl;
 
-    while (true) {
-        pcap_pkthdr* hdr;
-        const u_char* packet;
+    thread worker(packet_processor, target_name);
+
+    while (running) {
+        pcap_pkthdr *hdr;
+        const u_char *packet;
         int res = pcap_next_ex(handle, &hdr, &packet);
-        if (res != 1) continue;
+        if (res == 0) continue;
+        if (res == -1 || res == -2) break;
 
-        const ip* ip_hdr = (ip*)(packet + sizeof(ether_header));
-        if (ip_hdr->ip_p != IPPROTO_TCP) continue;
+        u_char *copy = new u_char[hdr->caplen];
+        memcpy(copy, packet, hdr->caplen);
 
-        const tcphdr* tcp_hdr = (tcphdr*)((u_char*)ip_hdr + ip_hdr->ip_hl * 4);
-        if (ntohs(tcp_hdr->th_dport) != 443) continue;
-
-        string sni = get_sni_from_packet(packet, hdr->len);
-        if (!sni.empty() && sni == block_name) {
-            cout << "[!] Match: " << sni << ". Sending RSTs." << endl;
-            inject_tcp(ip_hdr, tcp_hdr, nullptr, 0, TH_RST);               // Forward
-            inject_tcp(ip_hdr, tcp_hdr, nullptr, 0, TH_RST | TH_ACK);     // Backward
+        {
+            lock_guard<mutex> lock(queue_mutex);
+            packet_queue.push({hdr, copy});
         }
+        queue_cv.notify_one();
     }
+
+    running = false;
+    queue_cv.notify_all();
+    worker.join();
 
     pcap_close(handle);
     return 0;
