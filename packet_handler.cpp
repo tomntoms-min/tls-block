@@ -1,15 +1,9 @@
 #include "packet_handler.h"
-// 표준 시스템 헤더를 사용합니다.
-#include <netinet/ip.h>
-#include <netinet/tcp.h>
 #include <iostream>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <unistd.h>
 #include <cstring>
+#include <netinet/in.h>
 
 // '새로운 정답 코드'의 강력한 체크섬 계산 방식을 도입합니다.
-// 이 함수 하나로 IP와 TCP 체크섬을 모두 처리합니다.
 uint16_t PacketHandler::calculateChecksum(uint16_t *buf, int nbytes) {
     unsigned long sum = 0;
     while (nbytes > 1) {
@@ -19,22 +13,15 @@ uint16_t PacketHandler::calculateChecksum(uint16_t *buf, int nbytes) {
     if (nbytes) {
         sum += *(uint8_t*)buf;
     }
-    while (sum >> 16) {
-        sum = (sum & 0xFFFF) + (sum >> 16);
-    }
+    sum = (sum >> 16) + (sum & 0xFFFF);
+    sum += (sum >> 16);
     return (uint16_t)~sum;
 }
 
-
-bool Flow::operator<(const Flow& other) const {
-    if (src_ip != other.src_ip) return src_ip < other.src_ip;
-    if (dst_ip != other.dst_ip) return dst_ip < other.dst_ip;
-    if (src_port != other.src_port) return src_port < other.src_port;
-    return dst_port < other.dst_port;
+PacketHandler::PacketHandler(pcap_t* handle, uint8_t* my_mac, std::string server_name)
+    : pcap_handle_(handle), target_server_name_(server_name) {
+    memcpy(my_mac_, my_mac, 6);
 }
-
-PacketHandler::PacketHandler(pcap_t* handle, std::string iface, Mac my_mac, Ip my_ip, std::string server_name)
-    : pcap_handle_(handle), interface_name_(iface), my_mac_(my_mac), my_ip_(my_ip), target_server_name_(server_name) {}
 
 void PacketHandler::handlePacket(const struct pcap_pkthdr* header, const uint8_t* packet) {
     (void)header;
@@ -51,14 +38,8 @@ void PacketHandler::handlePacket(const struct pcap_pkthdr* header, const uint8_t
     const uint8_t* payload = reinterpret_cast<const uint8_t*>(tcp_hdr) + tcp_hdr_len;
     int payload_len = ntohs(ip_hdr->ip_len) - ip_hdr_len - tcp_hdr_len;
 
-    if (payload_len <= 0) return;
+    if (payload_len <= 5 || payload[0] != 0x16) return;
 
-    // TLS Client Hello인지 간단히 확인 (payload[0] == 0x16)
-    if (payload[0] != 0x16) {
-        return;
-    }
-    
-    // SNI 파싱은 더 간단한 방식으로 대체 (세부 구조체 대신 직접 파싱)
     std::string hostname = parseSNI(payload, payload_len);
 
     if (!hostname.empty() && hostname.find(target_server_name_) != std::string::npos) {
@@ -69,11 +50,11 @@ void PacketHandler::handlePacket(const struct pcap_pkthdr* header, const uint8_t
 }
 
 std::string PacketHandler::parseSNI(const uint8_t* payload, int len) {
-    if (len < 43) return ""; // Client Hello 최소 길이 확인
-
-    // 오프셋을 직접 계산하여 Extensions 영역으로 이동
-    int offset = 5 + 4; // RecordHdr + HandshakeHdr
-    offset += 2 + 32; // Version + Random
+    // Record Layer(5) + Handshake Header(4)
+    if (len < 9 || payload[5] != 0x01) return ""; // 0x01: Client Hello
+    
+    int offset = 5 + 4; 
+    offset += 2 + 32; // Version(2) + Random(32)
     
     if (offset >= len) return "";
     uint8_t session_id_len = payload[offset];
@@ -127,23 +108,22 @@ void PacketHandler::sendForwardRst(const uint8_t* orig_packet, const struct ip* 
     struct ip* new_ip = reinterpret_cast<struct ip*>(packet.data() + eth_sz);
     new_ip->ip_len = htons(ip_sz + tcp_sz);
     new_ip->ip_sum = 0;
-    new_ip->ip_sum = calculateChecksum(reinterpret_cast<uint16_t*>(new_ip), ip_sz);
+    new_ip->ip_sum = htons(calculateChecksum(reinterpret_cast<uint16_t*>(new_ip), ip_sz));
 
     struct tcphdr* new_tcp = reinterpret_cast<struct tcphdr*>(packet.data() + eth_sz + ip_sz);
     new_tcp->th_seq = htonl(ntohl(tcp_hdr->th_seq) + payload_len);
     new_tcp->th_flags = TH_RST | TH_ACK;
     new_tcp->th_sum = 0;
 
-    // TCP Checksum
     int pseudo_hdr_sz = 12 + tcp_sz;
     std::vector<uint8_t> pseudo_packet(pseudo_hdr_sz);
-    memcpy(pseudo_packet.data(), &new_ip->ip_src, 8); // src/dst ip
+    memcpy(pseudo_packet.data(), &new_ip->ip_src, 8);
     pseudo_packet[8] = 0;
     pseudo_packet[9] = IPPROTO_TCP;
     uint16_t tcp_len_n = htons(tcp_sz);
     memcpy(pseudo_packet.data() + 10, &tcp_len_n, 2);
     memcpy(pseudo_packet.data() + 12, new_tcp, tcp_sz);
-    new_tcp->th_sum = calculateChecksum(reinterpret_cast<uint16_t*>(pseudo_packet.data()), pseudo_hdr_sz);
+    new_tcp->th_sum = htons(calculateChecksum(reinterpret_cast<uint16_t*>(pseudo_packet.data()), pseudo_hdr_sz));
     
     if (pcap_sendpacket(pcap_handle_, packet.data(), total_hdr_sz) != 0) {
         fprintf(stderr, "pcap_sendpacket error: %s\n", pcap_geterr(pcap_handle_));
@@ -166,7 +146,7 @@ void PacketHandler::sendBackwardRst(const struct ip* ip_hdr, const struct tcphdr
     new_ip->ip_src = ip_hdr->ip_dst;
     new_ip->ip_dst = ip_hdr->ip_src;
     new_ip->ip_sum = 0;
-    new_ip->ip_sum = calculateChecksum(reinterpret_cast<uint16_t*>(new_ip), ip_sz);
+    new_ip->ip_sum = htons(calculateChecksum(reinterpret_cast<uint16_t*>(new_ip), ip_sz));
 
     struct tcphdr* new_tcp = reinterpret_cast<struct tcphdr*>(packet.data() + ip_sz);
     new_tcp->th_sport = tcp_hdr->th_dport;
@@ -178,16 +158,15 @@ void PacketHandler::sendBackwardRst(const struct ip* ip_hdr, const struct tcphdr
     new_tcp->th_win = htons(60000);
     new_tcp->th_sum = 0;
 
-    // TCP Checksum
     int pseudo_hdr_sz = 12 + tcp_sz;
     std::vector<uint8_t> pseudo_packet(pseudo_hdr_sz);
-    memcpy(pseudo_packet.data(), &new_ip->ip_src, 8); // src/dst ip
+    memcpy(pseudo_packet.data(), &new_ip->ip_src, 8);
     pseudo_packet[8] = 0;
     pseudo_packet[9] = IPPROTO_TCP;
     uint16_t tcp_len_n = htons(tcp_sz);
     memcpy(pseudo_packet.data() + 10, &tcp_len_n, 2);
     memcpy(pseudo_packet.data() + 12, new_tcp, tcp_sz);
-    new_tcp->th_sum = calculateChecksum(reinterpret_cast<uint16_t*>(pseudo_packet.data()), pseudo_hdr_sz);
+    new_tcp->th_sum = htons(calculateChecksum(reinterpret_cast<uint16_t*>(pseudo_packet.data()), pseudo_hdr_sz));
 
     int sd = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
     if (sd < 0) {
