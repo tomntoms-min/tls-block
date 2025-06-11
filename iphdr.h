@@ -17,8 +17,9 @@ struct IpHdr final {
     uint32_t sip_;
     uint32_t dip_;
 
-    Ip sip() { return Ip(ntohl(sip_)); }
-    Ip dip() { return Ip(ntohl(dip_)); }
+    // const 키워드를 추가하여 const 객체에서도 호출 가능하도록 수정
+    Ip sip() const { return Ip(ntohl(sip_)); }
+    Ip dip() const { return Ip(ntohl(dip_)); }
 
     // Protocol(ip_protocol)
     enum: uint8_t {
