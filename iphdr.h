@@ -1,40 +1,40 @@
 #pragma once
-#include <cstdint>
-#include <arpa/inet.h>
+
+#include <netinet/in.h>
 #include "ip.h"
 
 #pragma pack(push, 1)
+
 struct IpHdr final {
-    // 사용자가 제공한 비트필드 구조
-    uint8_t ip_len:4;
-    uint8_t ip_v:4;
-    uint8_t tos;
-    uint16_t total_len;
-    uint16_t id;
-    uint8_t frag_offset_1:5;
-    uint8_t more_fragment:1;
-    uint8_t dont_fragment:1;
-    uint8_t reserved_zero:1;
-    uint8_t frag_offset_2;
+    uint8_t version_and_ihl;
+    uint8_t dscp_and_ecn;
+    uint16_t total_length;
+    uint16_t identification;
+    uint16_t flags_and_fragment_offset;
     uint8_t ttl;
-    uint8_t proto;
-    uint16_t check;
-    Ip sip_;
-    Ip dip_;
+    uint8_t protocol;
+    uint16_t checksum;
+    uint32_t sip_;
+    uint32_t dip_;
 
-    // [수정 1] const 추가: 이 함수는 멤버 변수를 변경하지 않음을 명시
-    // [수정 2] ntohl 제거: sip_와 dip_는 이미 호스트 바이트 순서의 Ip 객체이므로 변환 불필요
-    Ip sip() const { return sip_; }
-	Ip dip() const { return dip_; }
+    Ip sip() { return Ip(ntohl(sip_)); }
+    Ip dip() { return Ip(ntohl(dip_)); }
 
-    // [추가] 가독성을 위해 IP 헤더 길이를 반환하는 헬퍼 함수 추가
-    uint8_t ipHdrLen() const { return ip_len * 4; }
-
-    // enum은 그대로 유지
+    // Protocol(ip_protocol)
     enum: uint8_t {
         ICMP = 1,
+        IGMP = 2,
         TCP = 6,
+        IGRP = 9,
         UDP = 17,
+        GRE = 47,
+        ESP = 50,
+        AH = 51,
+        SKIP = 57,
+        EIGRP = 88,
+        OSPF = 89,
+        L2TP = 115
     };
 };
+
 #pragma pack(pop)
