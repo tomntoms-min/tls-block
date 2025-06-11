@@ -49,7 +49,6 @@ static uint16_t calculate_checksum(const void* buf, size_t len) {
         sum += ntohs(*p++);
         len -= 2;
     }
-    // [해결] reinterpret_cast로 타입 캐스팅 오류 해결
     if (len) sum += (*reinterpret_cast<const uint8_t*>(p)) << 8;
 
     while (sum >> 16) sum = (sum & 0xFFFF) + (sum >> 16);
@@ -67,7 +66,7 @@ struct PseudoHdr {
 };
 #pragma pack(pop)
 
-// 정방향 RST (pcap_sendpacket 사용)
+// 정방향 RST (서버로): 서버의 세션을 즉시 끊기 위해 RST를 보냄
 static void send_forward_rst(pcap_t* handle, const ReassemblyContext& ctx, const Mac& my_mac) {
     vector<uint8_t> packet(sizeof(EthHdr) + sizeof(IpHdr) + sizeof(TcpHdr));
     EthHdr* eth = reinterpret_cast<EthHdr*>(packet.data());
@@ -87,9 +86,8 @@ static void send_forward_rst(pcap_t* handle, const ReassemblyContext& ctx, const
     tcp->th_flags = TcpHdr::RST | TcpHdr::ACK;
     tcp->th_sum = 0;
 
-    // [해결] 리스트 초기화 대신 명시적 할당으로 오류 해결
     PseudoHdr psh;
-    psh.src_ip = ip->sip_; // Ip 객체는 uint32_t로 암시적 형변환됨
+    psh.src_ip = ip->sip_;
     psh.dst_ip = ip->dip_;
     psh.reserved = 0;
     psh.protocol = IpHdr::TCP;
@@ -104,8 +102,8 @@ static void send_forward_rst(pcap_t* handle, const ReassemblyContext& ctx, const
     pcap_sendpacket(handle, packet.data(), packet.size());
 }
 
-// 역방향 RST (Raw 소켓 사용)
-static void send_backward_rst(const ReassemblyContext& ctx) {
+// [핵심 변경] 역방향 FIN (클라이언트로): 클라이언트를 속여 정상 종료처럼 보이게 함
+static void send_backward_fin(const ReassemblyContext& ctx) {
     vector<uint8_t> packet(sizeof(IpHdr) + sizeof(TcpHdr));
     IpHdr* ip = reinterpret_cast<IpHdr*>(packet.data());
     TcpHdr* tcp = reinterpret_cast<TcpHdr*>(ip + 1);
@@ -117,9 +115,11 @@ static void send_backward_rst(const ReassemblyContext& ctx) {
     
     memcpy(tcp, &ctx.tcp_hdr, sizeof(TcpHdr));
     swap(tcp->th_sport, tcp->th_dport);
+    
+    // 서버가 보낸 것처럼 FIN, ACK 패킷 위조
     tcp->th_seq = ctx.tcp_hdr.th_ack;
     tcp->th_ack = htonl(ntohl(ctx.tcp_hdr.th_seq) + ctx.buffer.size());
-    tcp->th_flags = TcpHdr::RST | TcpHdr::ACK;
+    tcp->th_flags = TcpHdr::FIN | TcpHdr::ACK; // RST 대신 FIN, ACK 플래그 사용
     tcp->th_sum = 0;
 
     PseudoHdr psh;
@@ -145,7 +145,7 @@ static void send_backward_rst(const ReassemblyContext& ctx) {
     close(sock);
 }
     
-// SNI 파싱
+// SNI 파싱 (이전과 동일)
 static string find_sni(const vector<uint8_t>& buffer) {
     const uint8_t* data = buffer.data(); size_t len = buffer.size();
     size_t pos = sizeof(Tls);
@@ -190,14 +190,12 @@ int main(int argc, char* argv[]) {
         const EthHdr* eth = (const EthHdr*)packet; if (eth->type() != EthHdr::Ip4) continue;
         const IpHdr* ip = (const IpHdr*)(eth + 1); if (ip->proto != IpHdr::TCP) continue;
         
-        // [수정] 새로운 ipHdrLen() 헬퍼 함수 사용
         size_t ip_hdr_len = ip->ipHdrLen();
         const TcpHdr* tcp = (const TcpHdr*)((u_char*)ip + ip_hdr_len);
         size_t tcp_hdr_len = tcp->th_off * 4;
         size_t payload_len = ntohs(ip->total_len) - ip_hdr_len - tcp_hdr_len;
         const uint8_t* payload = (const uint8_t*)tcp + tcp_hdr_len;
 
-        // [핵심] const_cast가 사라지고, 코드가 깨끗하고 정상적으로 동작함
         ConnectionKey key{ip->sip(), ip->dip(), ntohs(tcp->th_sport), ntohs(tcp->th_dport)};
         
         if (tcp->th_flags & (TcpHdr::RST | TcpHdr::FIN)) { session_manager.erase(key); continue; }
@@ -219,9 +217,10 @@ int main(int argc, char* argv[]) {
             if (!sni.empty()) {
                 cout << "[*] Detected SNI: " << sni << endl;
                 if (sni.find(target_host) != string::npos) {
-                    cout << "[!] Match found! Blocking..." << endl;
+                    cout << "[!] Match found! Interrupting handshake..." << endl;
+                    // [핵심] 서버에는 RST를, 클라이언트에는 FIN을 보내는 비대칭 전략
                     send_forward_rst(handle, ctx, my_mac);
-                    send_backward_rst(ctx);
+                    send_backward_fin(ctx);
                 }
             }
             session_manager.erase(key);
