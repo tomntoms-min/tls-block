@@ -169,7 +169,10 @@ void PacketHandler::sendBackwardRst(const IpHdr& ip_hdr_orig, const TcpHdr& tcp_
     std::swap(tcp_hdr->th_sport, tcp_hdr->th_dport);
     
     tcp_hdr->th_flags = TcpHdr::RST | TcpHdr::ACK;
-    tcp_hdr->th_seq = tcp_hdr_orig.th_ack;
+    
+    // "정답 코드"와 동일하게 ntohl/htonl 변환을 명시적으로 수행
+    tcp_hdr->th_seq = htonl(ntohl(tcp_hdr_orig.th_ack));
+
     tcp_hdr->th_ack = htonl(ntohl(tcp_hdr_orig.th_seq) + payload_len);
     tcp_hdr->th_off = (sizeof(TcpHdr) / 4);
     tcp_hdr->th_sum = 0;
