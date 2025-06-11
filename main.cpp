@@ -4,31 +4,36 @@
 #include <unistd.h>
 #include <sys/ioctl.h>
 #include <net/if.h>
-#include <cstring>
+#include "mac.h"
+#include "ip.h"
 #include "packet_handler.h"
 
 void usage() {
     std::cout << "syntax : tls-block <interface> <server name>\n";
-    std::cout << "sample : tls-block wlan0 naver.com\n";
+    std::cout << "sample : tls-block wlan0 test.gilgil.net\n";
 }
 
-// MAC 주소를 가져오는 함수
-bool getMyMacAddress(const std::string& iface, uint8_t* mac_addr) {
+bool getMyInfo(const std::string& iface, Mac& mac, Ip& ip) {
     struct ifreq ifr;
     int sock = socket(AF_INET, SOCK_DGRAM, 0);
-    if (sock < 0) {
-        perror("socket");
-        return false;
-    }
+    if (sock < 0) return false;
 
     strncpy(ifr.ifr_name, iface.c_str(), IFNAMSIZ);
+
     if (ioctl(sock, SIOCGIFHWADDR, &ifr) < 0) {
         perror("ioctl(mac)");
         close(sock);
         return false;
     }
-    
-    memcpy(mac_addr, ifr.ifr_hwaddr.sa_data, 6);
+    mac = Mac(reinterpret_cast<const uint8_t*>(ifr.ifr_hwaddr.sa_data));
+
+    if (ioctl(sock, SIOCGIFADDR, &ifr) < 0) {
+        perror("ioctl(ip)");
+        close(sock);
+        return false;
+    }
+    ip = Ip(ntohl(reinterpret_cast<struct sockaddr_in*>(&ifr.ifr_addr)->sin_addr.s_addr));
+
     close(sock);
     return true;
 }
@@ -41,17 +46,15 @@ int main(int argc, char* argv[]) {
 
     std::string interface_name = argv[1];
     std::string server_name = argv[2];
-    uint8_t my_mac[6];
+    Mac my_mac;
+    Ip my_ip;
 
-    if (!getMyMacAddress(interface_name, my_mac)) {
-        std::cerr << "Failed to get MAC address for interface " << interface_name << std::endl;
+    if (!getMyInfo(interface_name, my_mac, my_ip)) {
+        std::cerr << "Failed to get MAC/IP for interface " << interface_name << std::endl;
         return -1;
     }
-    
-    char mac_str[18];
-    sprintf(mac_str, "%02x:%02x:%02x:%02x:%02x:%02x", my_mac[0], my_mac[1], my_mac[2], my_mac[3], my_mac[4], my_mac[5]);
-    std::cout << "Interface: " << interface_name << " | MAC: " << mac_str << std::endl;
-    std::cout << "Blocking server pattern: " << server_name << std::endl;
+    std::cout << "Interface: " << interface_name << " | MAC: " << std::string(my_mac) << " | IP: " << std::string(my_ip) << std::endl;
+    std::cout << "Blocking server: " << server_name << std::endl;
 
     char errbuf[PCAP_ERRBUF_SIZE];
     pcap_t* pcap = pcap_open_live(interface_name.c_str(), BUFSIZ, 1, 1, errbuf);
@@ -60,14 +63,14 @@ int main(int argc, char* argv[]) {
         return -1;
     }
 
-    PacketHandler handler(pcap, my_mac, server_name);
+    PacketHandler handler(pcap, interface_name, my_mac, my_ip, server_name);
 
     while (true) {
         struct pcap_pkthdr* header;
         const uint8_t* packet;
         int res = pcap_next_ex(pcap, &header, &packet);
         if (res == 0) continue;
-        if (res < 0) {
+        if (res == PCAP_ERROR || res == PCAP_ERROR_BREAK) {
             std::cerr << "pcap_next_ex error: " << pcap_geterr(pcap) << std::endl;
             break;
         }
