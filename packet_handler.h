@@ -10,7 +10,7 @@
 #include "mac.h"
 #include "ip.h"
 
-// Represents a 4-tuple for a TCP flow
+// TCP 흐름을 식별하기 위한 4-tuple 구조체
 struct Flow {
     Ip src_ip;
     Ip dst_ip;
@@ -20,10 +20,9 @@ struct Flow {
     bool operator<(const Flow& other) const;
 };
 
-// Holds state for a segmented TCP stream
+// 조각화된 TCP 스트림의 상태를 저장하는 구조체
 struct Stream {
     std::vector<uint8_t> data;
-    uint32_t next_seq{0};
     EthHdr eth_hdr;
     IpHdr ip_hdr;
     TcpHdr tcp_hdr;
@@ -42,8 +41,8 @@ private:
     std::string target_server_name_;
     std::map<Flow, Stream> active_streams_;
 
-    void parse(const uint8_t* packet);
-    bool findSNIAndBlock(const Flow& flow, const uint8_t* tls_data, size_t tls_len);
+    // 함수 시그니처 수정
+    bool findSNIAndBlock(const EthHdr& eth_hdr, const IpHdr& ip_hdr, const TcpHdr& tcp_hdr, const uint8_t* tls_data, size_t tls_len);
     void sendForwardRst(const EthHdr& eth_hdr, const IpHdr& ip_hdr, const TcpHdr& tcp_hdr, size_t payload_len);
     void sendBackwardRst(const IpHdr& ip_hdr, const TcpHdr& tcp_hdr, size_t payload_len);
     
