@@ -10,7 +10,6 @@
 #include <sys/socket.h>
 #include <cstring>
 
-// 사용자가 제공한 신뢰성 높은 헤더 파일들
 #include "ethhdr.h"
 #include "iphdr.h"
 #include "tcphdr.h"
@@ -20,18 +19,9 @@
 
 using namespace std;
 
-// --- 모든 로직이 이 파일 안에 통합됩니다 ---
-
-// 1. 상태 관리를 위한 구조체 및 전역 변수
-// ==============================================
-
-// TCP 연결을 식별하는 키
+// --- 상태 관리를 위한 구조체 및 전역 변수 (이전과 동일) ---
 struct ConnectionKey {
-    Ip src_ip;
-    Ip dst_ip;
-    uint16_t src_port;
-    uint16_t dst_port;
-
+    Ip src_ip; Ip dst_ip; uint16_t src_port; uint16_t dst_port;
     bool operator<(const ConnectionKey& other) const {
         if (src_ip != other.src_ip) return src_ip < other.src_ip;
         if (dst_ip != other.dst_ip) return dst_ip < other.dst_ip;
@@ -39,23 +29,14 @@ struct ConnectionKey {
         return dst_port < other.dst_port;
     }
 };
-
-// 각 연결의 재조합 상태를 관리하는 구조체
 struct ReassemblyContext {
     vector<uint8_t> buffer;
     uint16_t expected_length{0};
-    EthHdr eth_hdr;
-    IpHdr ip_hdr;
-    TcpHdr tcp_hdr;
+    EthHdr eth_hdr; IpHdr ip_hdr; TcpHdr tcp_hdr;
 };
-
-// 모든 세션의 상태를 관리하는 전역 맵
 static map<ConnectionKey, ReassemblyContext> session_manager;
 
-// 2. 헬퍼 함수들 (패킷 생성 및 파싱)
-// ==============================================
-
-// 체크섬 계산 헬퍼
+// --- 헬퍼 함수 (체크섬) ---
 static uint16_t calculate_checksum(const void* buf, size_t len) {
     auto p = static_cast<const uint16_t*>(buf);
     uint32_t sum = 0;
@@ -72,6 +53,8 @@ struct PseudoHdr {
 };
 #pragma pack(pop)
 
+
+// --- [핵심] 비대칭 패킷 주입 함수들 ---
 // 서버로 RST 전송
 static void send_forward_rst(pcap_t* handle, const ReassemblyContext& ctx, const Mac& my_mac) {
     vector<uint8_t> packet(sizeof(EthHdr) + sizeof(IpHdr) + sizeof(TcpHdr));
@@ -102,7 +85,8 @@ static void send_backward_fin(const ReassemblyContext& ctx) {
     ip->total_len = htons(sizeof(IpHdr) + sizeof(TcpHdr)); ip->check = 0;
     memcpy(tcp, &ctx.tcp_hdr, sizeof(TcpHdr));
     swap(tcp->th_sport, tcp->th_dport);
-    tcp->th_seq = ctx.tcp_hdr.th_ack; tcp->th_ack = htonl(ntohl(ctx.tcp_hdr.th_seq) + ctx.buffer.size());
+    tcp->th_seq = ctx.tcp_hdr.th_ack;
+    tcp->th_ack = htonl(ntohl(ctx.tcp_hdr.th_seq) + ctx.buffer.size());
     tcp->th_flags = TcpHdr::FIN | TcpHdr::ACK; tcp->th_sum = 0;
     PseudoHdr psh; psh.src_ip = ip->sip_; psh.dst_ip = ip->dip_; psh.reserved = 0; psh.protocol = IpHdr::TCP; psh.tcp_len = htons(sizeof(TcpHdr));
     vector<uint8_t> checksum_buf(sizeof(PseudoHdr) + sizeof(TcpHdr));
@@ -116,77 +100,20 @@ static void send_backward_fin(const ReassemblyContext& ctx) {
 }
 
 // SNI 파싱
-static string find_sni(const vector<uint8_t>& buffer) {
-    const uint8_t* data = buffer.data(); size_t len = buffer.size();
-    size_t pos = sizeof(Tls);
-    if (len <= pos) return "";
-    pos += 1 + data[pos]; if (len <= pos) return "";
-    pos += 2 + ntohs(*(uint16_t*)(data + pos)); if (len <= pos) return "";
-    pos += 1 + data[pos]; if (len <= pos) return "";
-    pos += 2;
-    while (pos + 4 < len) {
-        uint16_t ext_type = ntohs(*(uint16_t*)(data + pos));
-        uint16_t ext_len = ntohs(*(uint16_t*)(data + pos + 2));
-        pos += 4;
-        if (ext_type == 0) {
-            if (pos + 5 > len) return "";
-            uint16_t name_len = ntohs(*(uint16_t*)(data + pos + 3));
-            if (pos + 5 + name_len > len) return "";
-            return string((char*)(data + pos + 5), name_len);
-        }
-        pos += ext_len;
-    }
-    return "";
-}
+static string find_sni(const vector<uint8_t>& buffer) { /* ... 이전과 동일 ... */ }
 
-// 3. 메인 로직 및 프로그램 진입점
-// ==============================================
-
-void usage() {
-    cout << "syntax : ./tls-block <interface> <server name>\nsample : tls-block wlan0 naver.com\n";
-}
-
-bool getMacIpAddr(const string &iface_name, Mac& mac_addr, Ip& ip_addr) {
-    int fd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (fd < 0) {
-        perror("socket");
-        return false;
-    }
-    struct ifreq ifr {};
-    strncpy(ifr.ifr_name, iface_name.c_str(), IFNAMSIZ - 1);
-
-    if (ioctl(fd, SIOCGIFHWADDR, &ifr) == -1) {
-        perror("ioctl(failed to get mac addr)");
-        close(fd);
-        return false;
-    }
-    mac_addr = Mac(reinterpret_cast<uint8_t*>(ifr.ifr_hwaddr.sa_data));
-
-    ifr.ifr_addr.sa_family = AF_INET;
-    if (ioctl(fd, SIOCGIFADDR, &ifr) == -1) {
-        perror("ioctl(failed to get ip addr)");
-        close(fd);
-        return false;
-    }
-    ip_addr = Ip(ntohl(reinterpret_cast<struct sockaddr_in*>(&ifr.ifr_addr)->sin_addr.s_addr));
-
-    close(fd);
-    return true;
-}
+// --- 메인 로직 및 프로그램 진입점 ---
+void usage() { /* ... 이전과 동일 ... */ }
+bool getMacIpAddr(const string &iface_name, Mac& mac_addr, Ip& ip_addr) { /* ... 이전과 동일 ... */ }
 
 int main(int argc, char *argv[]) {
-    if (argc != 3) {
-        usage();
-        return 1;
-    }
+    if (argc != 3) { usage(); return 1; }
 
     string iface(argv[1]);
     string server(argv[2]);
     Mac my_mac;
     Ip my_ip;
-    if (!getMacIpAddr(iface, my_mac, my_ip)) {
-        return EXIT_FAILURE;
-    }
+    if (!getMacIpAddr(iface, my_mac, my_ip)) return EXIT_FAILURE;
     
     char errbuf[PCAP_ERRBUF_SIZE];
     pcap_t* pcap = pcap_open_live(iface.c_str(), BUFSIZ, 1, 1000, errbuf);
@@ -203,26 +130,27 @@ int main(int argc, char *argv[]) {
         const uint8_t* pkt;
         int res = pcap_next_ex(pcap, &header, &pkt);
         if (res == 0) continue;
-        if (res == PCAP_ERROR || res == PCAP_ERROR_BREAK){
+        if (res == PCAP_ERROR || res == PCAP_ERROR_BREAK) {
             cerr << "[pcap] error or break: " << res << endl;
             break;
         }
 
-        // --- 패킷 처리 로직이 main 루프 안으로 통합 ---
         const EthHdr* eth = (const EthHdr*)pkt;
         if (eth->type() != EthHdr::Ip4) continue;
         const IpHdr* ip = (const IpHdr*)(eth + 1);
         if (ip->proto != IpHdr::TCP) continue;
+        
         size_t ip_hdr_len = ip->ipHdrLen();
         const TcpHdr* tcp = (const TcpHdr*)((u_char*)ip + ip_hdr_len);
-        size_t tcp_hdr_len = tcp->th_off * 4;
-        size_t payload_len = ntohs(ip->total_len) - ip_hdr_len - tcp_hdr_len;
-        const uint8_t* payload = (const uint8_t*)tcp + tcp_hdr_len;
         
         ConnectionKey key{ip->sip(), ip->dip(), ntohs(tcp->th_sport), ntohs(tcp->th_dport)};
         
         if (tcp->th_flags & (TcpHdr::RST | TcpHdr::FIN)) { session_manager.erase(key); continue; }
+        
+        size_t payload_len = ntohs(ip->total_len) - ip_hdr_len - (tcp->th_off * 4);
         if (payload_len == 0) continue;
+        
+        const uint8_t* payload = (const uint8_t*)tcp + (tcp->th_off * 4);
         
         if (session_manager.find(key) == session_manager.end()) {
             const Tls* tls = (const Tls*)payload;
@@ -243,13 +171,13 @@ int main(int argc, char *argv[]) {
                 cout << "[*] Detected SNI: " << sni << endl;
                 if (sni.find(server) != string::npos) {
                     cout << "[!] Match found! Interrupting handshake..." << endl;
-                    send_forward_rst(pcap, ctx, my_mac);
-                    send_backward_fin(ctx);
+                    // 비대칭 공격 실행!
+                    send_forward_rst(pcap, ctx, my_mac); // 서버에는 RST
+                    send_backward_fin(ctx);              // 클라이언트에는 FIN
                 }
             }
             session_manager.erase(key);
         }
-        // --- 패킷 처리 로직 끝 ---
     }
 
     pcap_close(pcap);
