@@ -1,9 +1,15 @@
 #include "packet_handler.h"
+// 표준 시스템 헤더를 사용합니다.
+#include <netinet/ip.h>
+#include <netinet/tcp.h>
 #include <iostream>
-#include <cstring>
+#include <sys/socket.h>
 #include <netinet/in.h>
+#include <unistd.h> // close() 함수를 위해 이 헤더를 추가합니다.
+#include <cstring>
 
 // '새로운 정답 코드'의 강력한 체크섬 계산 방식을 도입합니다.
+// 이 함수 하나로 IP와 TCP 체크섬을 모두 처리합니다.
 uint16_t PacketHandler::calculateChecksum(uint16_t *buf, int nbytes) {
     unsigned long sum = 0;
     while (nbytes > 1) {
@@ -17,6 +23,7 @@ uint16_t PacketHandler::calculateChecksum(uint16_t *buf, int nbytes) {
     sum += (sum >> 16);
     return (uint16_t)~sum;
 }
+
 
 PacketHandler::PacketHandler(pcap_t* handle, uint8_t* my_mac, std::string server_name)
     : pcap_handle_(handle), target_server_name_(server_name) {
