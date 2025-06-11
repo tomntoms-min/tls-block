@@ -1,9 +1,30 @@
 #include "packet_handler.h"
-#include "tlshdr.h" // 사용자께서 제공해주신 tlshdr.h를 사용합니다
+// 표준 시스템 헤더를 사용합니다.
+#include <netinet/ip.h>
+#include <netinet/tcp.h>
 #include <iostream>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <unistd.h>
+#include <cstring>
+
+// '새로운 정답 코드'의 강력한 체크섬 계산 방식을 도입합니다.
+// 이 함수 하나로 IP와 TCP 체크섬을 모두 처리합니다.
+uint16_t PacketHandler::calculateChecksum(uint16_t *buf, int nbytes) {
+    unsigned long sum = 0;
+    while (nbytes > 1) {
+        sum += *buf++;
+        nbytes -= 2;
+    }
+    if (nbytes) {
+        sum += *(uint8_t*)buf;
+    }
+    while (sum >> 16) {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    return (uint16_t)~sum;
+}
+
 
 bool Flow::operator<(const Flow& other) const {
     if (src_ip != other.src_ip) return src_ip < other.src_ip;
@@ -17,230 +38,172 @@ PacketHandler::PacketHandler(pcap_t* handle, std::string iface, Mac my_mac, Ip m
 
 void PacketHandler::handlePacket(const struct pcap_pkthdr* header, const uint8_t* packet) {
     (void)header;
-    const EthHdr* eth_hdr = reinterpret_cast<const EthHdr*>(packet);
-    if (eth_hdr->type() != EthHdr::Ip4) return;
+    const struct ether_header* eth_hdr = reinterpret_cast<const struct ether_header*>(packet);
+    if (ntohs(eth_hdr->ether_type) != ETHERTYPE_IP) return;
 
-    const IpHdr* ip_hdr = reinterpret_cast<const IpHdr*>(packet + sizeof(EthHdr));
-    
-    // 1. 이름 충돌을 피하기 위해 포인터로 직접 헤더 길이 계산
-    size_t ip_hdr_len = (*(reinterpret_cast<const uint8_t*>(ip_hdr)) & 0x0F) * 4;
+    const struct ip* ip_hdr = reinterpret_cast<const struct ip*>(packet + sizeof(struct ether_header));
+    if (ip_hdr->ip_p != IPPROTO_TCP) return;
 
-    // 2. 컴파일러 제안에 따라 'protocol' -> 'proto' 로 수정
-    if (ip_hdr->proto != IpHdr::TCP) return;
-
-    const TcpHdr* tcp_hdr = reinterpret_cast<const TcpHdr*>(reinterpret_cast<const uint8_t*>(ip_hdr) + ip_hdr_len);
-    size_t tcp_hdr_len = tcp_hdr->th_off * 4;
+    int ip_hdr_len = ip_hdr->ip_hl * 4;
+    const struct tcphdr* tcp_hdr = reinterpret_cast<const struct tcphdr*>(reinterpret_cast<const uint8_t*>(ip_hdr) + ip_hdr_len);
+    int tcp_hdr_len = tcp_hdr->th_off * 4;
 
     const uint8_t* payload = reinterpret_cast<const uint8_t*>(tcp_hdr) + tcp_hdr_len;
-    // 3. 컴파일러 제안에 따라 'total_length' -> 'total_len' 로 수정
-    size_t payload_len = ntohs(ip_hdr->total_len) - ip_hdr_len - tcp_hdr_len;
+    int payload_len = ntohs(ip_hdr->ip_len) - ip_hdr_len - tcp_hdr_len;
 
-    if (payload_len < (sizeof(TlsHdr) + sizeof(HandshakeHdr))) return;
-    
-    const TlsHdr* tls_hdr = reinterpret_cast<const TlsHdr*>(payload);
-    const HandshakeHdr* handshake_hdr = reinterpret_cast<const HandshakeHdr*>(payload + sizeof(TlsHdr));
+    if (payload_len <= 0) return;
 
-    if (tls_hdr->content_type_ != TlsHdr::Handshake || handshake_hdr->handshake_type_ != 0x01) {
-        active_streams_.clear();
+    // TLS Client Hello인지 간단히 확인 (payload[0] == 0x16)
+    if (payload[0] != 0x16) {
         return;
     }
+    
+    // SNI 파싱은 더 간단한 방식으로 대체 (세부 구조체 대신 직접 파싱)
+    std::string hostname = parseSNI(payload, payload_len);
 
-    Flow flow = {ip_hdr->sip(), ip_hdr->dip(), ntohs(tcp_hdr->th_sport), ntohs(tcp_hdr->th_dport)};
-    uint16_t expected_tls_len = ntohs(tls_hdr->length_) + sizeof(TlsHdr);
-
-    if (payload_len < expected_tls_len) { 
-        Stream& stream = active_streams_[flow];
-        if (stream.data.empty()) { 
-            stream.eth_hdr = *eth_hdr;
-            stream.ip_hdr = *ip_hdr;
-            stream.tcp_hdr = *tcp_hdr;
-        }
-        stream.data.insert(stream.data.end(), payload, payload + payload_len);
-
-        if (stream.data.size() >= expected_tls_len) {
-            if (findSNIAndBlock(stream.eth_hdr, stream.ip_hdr, stream.tcp_hdr, stream.data.data(), stream.data.size())) {
-                std::cout << "Blocked segmented connection to: " << target_server_name_ << std::endl;
-            }
-            active_streams_.erase(flow);
-        }
-    } else {
-        if (findSNIAndBlock(*eth_hdr, *ip_hdr, *tcp_hdr, payload, payload_len)) {
-            std::cout << "Blocked single-packet connection to: " << target_server_name_ << std::endl;
-        }
+    if (!hostname.empty() && hostname.find(target_server_name_) != std::string::npos) {
+         std::cout << "Target found in SNI: " << hostname << " -> Blocking!" << std::endl;
+        sendForwardRst(packet, ip_hdr, tcp_hdr, payload_len);
+        sendBackwardRst(ip_hdr, tcp_hdr, payload_len);
     }
 }
 
-bool PacketHandler::findSNIAndBlock(const EthHdr& eth_hdr, const IpHdr& ip_hdr, const TcpHdr& tcp_hdr, const uint8_t* tls_data, size_t tls_len) {
-    const uint8_t* p = tls_data + sizeof(TlsHdr) + sizeof(HandshakeHdr);
-    const uint8_t* end = tls_data + tls_len; 
+std::string PacketHandler::parseSNI(const uint8_t* payload, int len) {
+    if (len < 43) return ""; // Client Hello 최소 길이 확인
 
-    p += 34;
-
-    if (p + 1 > end) return false;
-    uint8_t session_id_len = *p;
-    p += 1 + session_id_len;
-
-    if (p + 2 > end) return false;
-    uint16_t cipher_suites_len = ntohs(*(reinterpret_cast<const uint16_t*>(p)));
-    p += 2 + cipher_suites_len;
-
-    if (p + 1 > end) return false;
-    uint8_t comp_methods_len = *p;
-    p += 1 + comp_methods_len;
+    // 오프셋을 직접 계산하여 Extensions 영역으로 이동
+    int offset = 5 + 4; // RecordHdr + HandshakeHdr
+    offset += 2 + 32; // Version + Random
     
-    if (p + 2 > end) return false;
-    uint16_t extensions_total_len = ntohs(*(reinterpret_cast<const uint16_t*>(p)));
-    p += 2;
-    const uint8_t* extensions_end = p + extensions_total_len;
-    if (extensions_end > end) extensions_end = end;
+    if (offset >= len) return "";
+    uint8_t session_id_len = payload[offset];
+    offset += 1 + session_id_len;
 
-    while (p + 4 <= extensions_end) {
-        uint16_t ext_type = ntohs(*(reinterpret_cast<const uint16_t*>(p)));
-        uint16_t ext_len = ntohs(*(reinterpret_cast<const uint16_t*>(p + 2)));
+    if (offset + 2 > len) return "";
+    uint16_t cipher_suites_len = ntohs(*(uint16_t*)(payload + offset));
+    offset += 2 + cipher_suites_len;
+
+    if (offset + 1 > len) return "";
+    uint8_t comp_len = payload[offset];
+    offset += 1 + comp_len;
+
+    if (offset + 2 > len) return "";
+    uint16_t ext_total_len = ntohs(*(uint16_t*)(payload + offset));
+    offset += 2;
+
+    const uint8_t* p = payload + offset;
+    const uint8_t* end = p + ext_total_len;
+    if (end > payload + len) end = payload + len;
+
+    while (p + 4 <= end) {
+        uint16_t ext_type = ntohs(*(uint16_t*)p);
+        uint16_t ext_len = ntohs(*(uint16_t*)(p + 2));
         p += 4;
+        if (p + ext_len > end) break;
         
-        if (ext_type == 0x0000) {
-            const uint8_t* sni_ptr = p;
-            if (sni_ptr + 5 > extensions_end) break;
-
-            uint16_t server_name_len = ntohs(*(reinterpret_cast<const uint16_t*>(sni_ptr + 3)));
-            if (sni_ptr + 5 + server_name_len > extensions_end) break; 
-
-            std::string server_name(reinterpret_cast<const char*>(sni_ptr + 5), server_name_len);
-
-            if (server_name.find(target_server_name_) != std::string::npos) {
-                std::cout << "Target found in SNI: " << server_name << " -> Blocking with RST strategy!" << std::endl;
-                sendForwardRst(eth_hdr, ip_hdr, tcp_hdr, tls_len);
-                sendBackwardRst(ip_hdr, tcp_hdr, tls_len);
-                return true;
-            }
+        if (ext_type == 0x0000) { // SNI
+            if (ext_len < 5) break;
+            uint16_t name_len = ntohs(*(uint16_t*)(p + 3));
+            if (p + 5 + name_len > end) break;
+            return std::string((char*)(p + 5), name_len);
         }
         p += ext_len;
     }
-    return false;
+    return "";
 }
 
-void PacketHandler::sendForwardRst(const EthHdr& eth_hdr_orig, const IpHdr& ip_hdr_orig, const TcpHdr& tcp_hdr_orig, size_t payload_len) {
-    const size_t packet_len = sizeof(EthHdr) + sizeof(IpHdr) + sizeof(TcpHdr);
-    std::vector<uint8_t> packet(packet_len);
-
-    EthHdr* eth_hdr = reinterpret_cast<EthHdr*>(packet.data());
-    eth_hdr->dmac_ = eth_hdr_orig.dmac();
-    eth_hdr->smac_ = my_mac_;
-    eth_hdr->type_ = htons(EthHdr::Ip4);
-
-    IpHdr* ip_hdr = reinterpret_cast<IpHdr*>(packet.data() + sizeof(EthHdr));
-    memcpy(ip_hdr, &ip_hdr_orig, sizeof(IpHdr));
+void PacketHandler::sendForwardRst(const uint8_t* orig_packet, const struct ip* ip_hdr, const struct tcphdr* tcp_hdr, int payload_len) {
+    int eth_sz = sizeof(struct ether_header);
+    int ip_sz = ip_hdr->ip_hl * 4;
+    int tcp_sz = tcp_hdr->th_off * 4;
+    int total_hdr_sz = eth_sz + ip_sz + tcp_sz;
     
-    // 컴파일러 제안 이름으로 수정
-    ip_hdr->total_len = htons(sizeof(IpHdr) + sizeof(TcpHdr));
-    ip_hdr->check = 0;
-    
-    TcpHdr* tcp_hdr = reinterpret_cast<TcpHdr*>(packet.data() + sizeof(EthHdr) + sizeof(IpHdr));
-    memcpy(tcp_hdr, &tcp_hdr_orig, sizeof(TcpHdr));
-    tcp_hdr->th_flags = TcpHdr::RST | TcpHdr::ACK;
-    tcp_hdr->th_seq = htonl(ntohl(tcp_hdr_orig.th_seq) + payload_len);
-    tcp_hdr->th_off = (sizeof(TcpHdr) / 4);
-    tcp_hdr->th_sum = 0;
-    
-    ip_hdr->check = calculateIpChecksum(ip_hdr);
-    tcp_hdr->th_sum = calculateTcpChecksum(ip_hdr, tcp_hdr, nullptr, 0);
+    std::vector<uint8_t> packet(total_hdr_sz);
+    memcpy(packet.data(), orig_packet, total_hdr_sz);
 
-    if (pcap_sendpacket(pcap_handle_, packet.data(), packet.size()) != 0) {
-        std::cerr << "pcap_sendpacket (forward) failed: " << pcap_geterr(pcap_handle_) << std::endl;
+    struct ether_header* eth = reinterpret_cast<struct ether_header*>(packet.data());
+    memcpy(eth->ether_shost, my_mac_, 6);
+
+    struct ip* new_ip = reinterpret_cast<struct ip*>(packet.data() + eth_sz);
+    new_ip->ip_len = htons(ip_sz + tcp_sz);
+    new_ip->ip_sum = 0;
+    new_ip->ip_sum = calculateChecksum(reinterpret_cast<uint16_t*>(new_ip), ip_sz);
+
+    struct tcphdr* new_tcp = reinterpret_cast<struct tcphdr*>(packet.data() + eth_sz + ip_sz);
+    new_tcp->th_seq = htonl(ntohl(tcp_hdr->th_seq) + payload_len);
+    new_tcp->th_flags = TH_RST | TH_ACK;
+    new_tcp->th_sum = 0;
+
+    // TCP Checksum
+    int pseudo_hdr_sz = 12 + tcp_sz;
+    std::vector<uint8_t> pseudo_packet(pseudo_hdr_sz);
+    memcpy(pseudo_packet.data(), &new_ip->ip_src, 8); // src/dst ip
+    pseudo_packet[8] = 0;
+    pseudo_packet[9] = IPPROTO_TCP;
+    uint16_t tcp_len_n = htons(tcp_sz);
+    memcpy(pseudo_packet.data() + 10, &tcp_len_n, 2);
+    memcpy(pseudo_packet.data() + 12, new_tcp, tcp_sz);
+    new_tcp->th_sum = calculateChecksum(reinterpret_cast<uint16_t*>(pseudo_packet.data()), pseudo_hdr_sz);
+    
+    if (pcap_sendpacket(pcap_handle_, packet.data(), total_hdr_sz) != 0) {
+        fprintf(stderr, "pcap_sendpacket error: %s\n", pcap_geterr(pcap_handle_));
     }
 }
 
-void PacketHandler::sendBackwardRst(const IpHdr& ip_hdr_orig, const TcpHdr& tcp_hdr_orig, size_t payload_len) {
-    const size_t packet_len = sizeof(IpHdr) + sizeof(TcpHdr);
-    std::vector<uint8_t> packet(packet_len);
+void PacketHandler::sendBackwardRst(const struct ip* ip_hdr, const struct tcphdr* tcp_hdr, int payload_len) {
+    int ip_sz = sizeof(struct ip);
+    int tcp_sz = sizeof(struct tcphdr);
+    int total_sz = ip_sz + tcp_sz;
 
-    IpHdr* ip_hdr = reinterpret_cast<IpHdr*>(packet.data());
-    memcpy(ip_hdr, &ip_hdr_orig, sizeof(IpHdr));
-    ip_hdr->sip_ = ip_hdr_orig.dip_;
-    ip_hdr->dip_ = ip_hdr_orig.sip_;
-    
-    // 컴파일러 제안 이름으로 수정
-    ip_hdr->total_len = htons(packet_len);
-    ip_hdr->check = 0;
-    
-    TcpHdr* tcp_hdr = reinterpret_cast<TcpHdr*>(packet.data() + sizeof(IpHdr));
-    memcpy(tcp_hdr, &tcp_hdr_orig, sizeof(TcpHdr));
-    std::swap(tcp_hdr->th_sport, tcp_hdr->th_dport);
-    
-    tcp_hdr->th_flags = TcpHdr::RST | TcpHdr::ACK;
-    
-    // "정답 코드"와 동일하게 ntohl/htonl 변환을 명시적으로 수행
-    tcp_hdr->th_seq = htonl(ntohl(tcp_hdr_orig.th_ack));
+    std::vector<uint8_t> packet(total_sz, 0);
 
-    tcp_hdr->th_ack = htonl(ntohl(tcp_hdr_orig.th_seq) + payload_len);
-    tcp_hdr->th_off = (sizeof(TcpHdr) / 4);
-    tcp_hdr->th_sum = 0;
+    struct ip* new_ip = reinterpret_cast<struct ip*>(packet.data());
+    new_ip->ip_v = 4;
+    new_ip->ip_hl = ip_sz / 4;
+    new_ip->ip_len = htons(total_sz);
+    new_ip->ip_ttl = 128;
+    new_ip->ip_p = IPPROTO_TCP;
+    new_ip->ip_src = ip_hdr->ip_dst;
+    new_ip->ip_dst = ip_hdr->ip_src;
+    new_ip->ip_sum = 0;
+    new_ip->ip_sum = calculateChecksum(reinterpret_cast<uint16_t*>(new_ip), ip_sz);
 
-    ip_hdr->check = calculateIpChecksum(ip_hdr);
-    tcp_hdr->th_sum = calculateTcpChecksum(ip_hdr, tcp_hdr, nullptr, 0);
-    
-    int sock = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
-    if (sock < 0) {
+    struct tcphdr* new_tcp = reinterpret_cast<struct tcphdr*>(packet.data() + ip_sz);
+    new_tcp->th_sport = tcp_hdr->th_dport;
+    new_tcp->th_dport = tcp_hdr->th_sport;
+    new_tcp->th_seq = tcp_hdr->th_ack;
+    new_tcp->th_ack = htonl(ntohl(tcp_hdr->th_seq) + payload_len);
+    new_tcp->th_off = tcp_sz / 4;
+    new_tcp->th_flags = TH_RST | TH_ACK;
+    new_tcp->th_win = htons(60000);
+    new_tcp->th_sum = 0;
+
+    // TCP Checksum
+    int pseudo_hdr_sz = 12 + tcp_sz;
+    std::vector<uint8_t> pseudo_packet(pseudo_hdr_sz);
+    memcpy(pseudo_packet.data(), &new_ip->ip_src, 8); // src/dst ip
+    pseudo_packet[8] = 0;
+    pseudo_packet[9] = IPPROTO_TCP;
+    uint16_t tcp_len_n = htons(tcp_sz);
+    memcpy(pseudo_packet.data() + 10, &tcp_len_n, 2);
+    memcpy(pseudo_packet.data() + 12, new_tcp, tcp_sz);
+    new_tcp->th_sum = calculateChecksum(reinterpret_cast<uint16_t*>(pseudo_packet.data()), pseudo_hdr_sz);
+
+    int sd = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
+    if (sd < 0) {
         perror("socket");
         return;
     }
-    int one = 1;
-    if (setsockopt(sock, IPPROTO_IP, IP_HDRINCL, &one, sizeof(one)) < 0) {
-        perror("setsockopt");
-        close(sock);
-        return;
-    }
-
-    struct sockaddr_in sin;
-    sin.sin_family = AF_INET;
-    sin.sin_port = tcp_hdr->th_dport;
-    sin.sin_addr.s_addr = ip_hdr->dip_;
-
-    if (sendto(sock, packet.data(), packet.size(), 0, (struct sockaddr*)&sin, sizeof(sin)) < 0) {
-        perror("sendto (backward-rst)");
-    }
-    close(sock);
-}
-
-uint16_t PacketHandler::calculateIpChecksum(IpHdr* ip_hdr) {
-    uint32_t sum = 0;
-    uint16_t* ptr = reinterpret_cast<uint16_t*>(ip_hdr);
-    for (size_t i = 0; i < sizeof(IpHdr) / 2; ++i) {
-        sum += ntohs(ptr[i]);
-    }
-    while (sum >> 16) {
-        sum = (sum & 0xFFFF) + (sum >> 16);
-    }
-    return htons(~static_cast<uint16_t>(sum));
-}
-
-uint16_t PacketHandler::calculateTcpChecksum(IpHdr* ip_hdr, TcpHdr* tcp_hdr, const uint8_t* data, size_t data_len) {
-    uint32_t sum = 0;
-    sum += (ntohl(ip_hdr->sip_) >> 16) & 0xFFFF;
-    sum += ntohl(ip_hdr->sip_) & 0xFFFF;
-    sum += (ntohl(ip_hdr->dip_) >> 16) & 0xFFFF;
-    sum += ntohl(ip_hdr->dip_) & 0xFFFF;
+    int on = 1;
+    setsockopt(sd, IPPROTO_IP, IP_HDRINCL, &on, sizeof(on));
     
-    // 컴파일러 제안 이름으로 수정
-    sum += htons(ip_hdr->proto);
-    size_t tcp_len = sizeof(TcpHdr) + data_len;
-    sum += htons(tcp_len);
+    struct sockaddr_in addr;
+    addr.sin_family = AF_INET;
+    addr.sin_port = new_tcp->th_dport;
+    addr.sin_addr = new_ip->ip_dst;
 
-    uint16_t* ptr = reinterpret_cast<uint16_t*>(tcp_hdr);
-    for (size_t i = 0; i < sizeof(TcpHdr) / 2; ++i) {
-        sum += ntohs(ptr[i]);
+    if (sendto(sd, packet.data(), total_sz, 0, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        perror("sendto");
     }
-    
-    const uint16_t* const_ptr = reinterpret_cast<const uint16_t*>(data);
-    for (size_t i = 0; i < data_len / 2; ++i) {
-        sum += ntohs(const_ptr[i]);
-    }
-    if (data_len % 2 != 0) {
-        sum += (data[data_len - 1] << 8);
-    }
-    while (sum >> 16) {
-        sum = (sum & 0xFFFF) + (sum >> 16);
-    }
-    return htons(~static_cast<uint16_t>(sum));
+    close(sd);
 }
