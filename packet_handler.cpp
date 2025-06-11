@@ -21,15 +21,19 @@ void PacketHandler::handlePacket(const struct pcap_pkthdr* header, const uint8_t
     if (eth_hdr->type() != EthHdr::Ip4) return;
 
     const IpHdr* ip_hdr = reinterpret_cast<const IpHdr*>(packet + sizeof(EthHdr));
+    
+    // 1. 이름 충돌을 피하기 위해 포인터로 직접 헤더 길이 계산
     size_t ip_hdr_len = (*(reinterpret_cast<const uint8_t*>(ip_hdr)) & 0x0F) * 4;
 
-    if (ip_hdr->protocol != IpHdr::TCP) return;
+    // 2. 컴파일러 제안에 따라 'protocol' -> 'proto' 로 수정
+    if (ip_hdr->proto != IpHdr::TCP) return;
 
     const TcpHdr* tcp_hdr = reinterpret_cast<const TcpHdr*>(reinterpret_cast<const uint8_t*>(ip_hdr) + ip_hdr_len);
     size_t tcp_hdr_len = tcp_hdr->th_off * 4;
 
     const uint8_t* payload = reinterpret_cast<const uint8_t*>(tcp_hdr) + tcp_hdr_len;
-    size_t payload_len = ntohs(ip_hdr->total_length) - ip_hdr_len - tcp_hdr_len;
+    // 3. 컴파일러 제안에 따라 'total_length' -> 'total_len' 로 수정
+    size_t payload_len = ntohs(ip_hdr->total_len) - ip_hdr_len - tcp_hdr_len;
 
     if (payload_len < (sizeof(TlsHdr) + sizeof(HandshakeHdr))) return;
     
@@ -66,54 +70,47 @@ void PacketHandler::handlePacket(const struct pcap_pkthdr* header, const uint8_t
     }
 }
 
-// ========================== 버그를 수정한 최종 파싱 로직 ==========================
 bool PacketHandler::findSNIAndBlock(const EthHdr& eth_hdr, const IpHdr& ip_hdr, const TcpHdr& tcp_hdr, const uint8_t* tls_data, size_t tls_len) {
-    // Client Hello 시작 위치: TLS Record 헤더와 Handshake 헤더 바로 다음
     const uint8_t* p = tls_data + sizeof(TlsHdr) + sizeof(HandshakeHdr);
-    const uint8_t* end = tls_data + tls_len; // 전체 페이로드의 끝
+    const uint8_t* end = tls_data + tls_len; 
 
-    // 1. Client Version (2 bytes)과 Client Random (32 bytes) 건너뛰기
-    p += 34;
+    p += 34; // Client Version (2) + Client Random (32)
 
-    // 2. Session ID 건너뛰기
     if (p + 1 > end) return false;
     uint8_t session_id_len = *p;
     p += 1 + session_id_len;
 
-    // 3. Cipher Suites 건너뛰기
     if (p + 2 > end) return false;
     uint16_t cipher_suites_len = ntohs(*(reinterpret_cast<const uint16_t*>(p)));
     p += 2 + cipher_suites_len;
 
-    // 4. Compression Methods 건너뛰기
     if (p + 1 > end) return false;
     uint8_t comp_methods_len = *p;
     p += 1 + comp_methods_len;
     
-    // 5. Extensions 파싱 시작
-    if (p + 2 > end) return false; // Extensions Length 필드가 있는지 확인
+    if (p + 2 > end) return false;
     uint16_t extensions_total_len = ntohs(*(reinterpret_cast<const uint16_t*>(p)));
     p += 2;
     const uint8_t* extensions_end = p + extensions_total_len;
-    if (extensions_end > end) extensions_end = end; // 경계 초과 방지
+    if (extensions_end > end) extensions_end = end;
 
     while (p + 4 <= extensions_end) {
         uint16_t ext_type = ntohs(*(reinterpret_cast<const uint16_t*>(p)));
         uint16_t ext_len = ntohs(*(reinterpret_cast<const uint16_t*>(p + 2)));
         p += 4;
         
-        if (ext_type == 0x0000) { // server_name (SNI)
+        if (ext_type == 0x0000) {
             const uint8_t* sni_ptr = p;
-            if (sni_ptr + 5 > extensions_end) break; // SNI 기본 구조를 위한 최소 길이 확인
+            if (sni_ptr + 5 > extensions_end) break;
 
             uint16_t server_name_len = ntohs(*(reinterpret_cast<const uint16_t*>(sni_ptr + 3)));
-            if (sni_ptr + 5 + server_name_len > extensions_end) break; // 실제 이름 길이 확인
+            if (sni_ptr + 5 + server_name_len > extensions_end) break; 
 
             std::string server_name(reinterpret_cast<const char*>(sni_ptr + 5), server_name_len);
 
             if (server_name.find(target_server_name_) != std::string::npos) {
                 std::cout << "Target found in SNI: " << server_name << " -> Blocking!" << std::endl;
-                sendForwardRst(eth_hdr, ip_hdr, tcp_hdr, tls_len); // tls_len은 전체 TLS payload 길이
+                sendForwardRst(eth_hdr, ip_hdr, tcp_hdr, tls_len);
                 sendBackwardRst(ip_hdr, tcp_hdr, tls_len);
                 return true;
             }
@@ -122,9 +119,7 @@ bool PacketHandler::findSNIAndBlock(const EthHdr& eth_hdr, const IpHdr& ip_hdr, 
     }
     return false;
 }
-// =================================================================================
 
-// 이하 RST 패킷 전송 및 체크섬 계산 함수들은 이전과 동일 (이미 컴파일 성공한 버전)
 void PacketHandler::sendForwardRst(const EthHdr& eth_hdr_orig, const IpHdr& ip_hdr_orig, const TcpHdr& tcp_hdr_orig, size_t payload_len) {
     const size_t packet_len = sizeof(EthHdr) + sizeof(IpHdr) + sizeof(TcpHdr);
     std::vector<uint8_t> packet(packet_len);
@@ -137,8 +132,9 @@ void PacketHandler::sendForwardRst(const EthHdr& eth_hdr_orig, const IpHdr& ip_h
     IpHdr* ip_hdr = reinterpret_cast<IpHdr*>(packet.data() + sizeof(EthHdr));
     memcpy(ip_hdr, &ip_hdr_orig, sizeof(IpHdr));
     
-    ip_hdr->total_length = htons(sizeof(IpHdr) + sizeof(TcpHdr));
-    ip_hdr->checksum = 0;
+    // 컴파일러 제안 이름으로 수정
+    ip_hdr->total_len = htons(sizeof(IpHdr) + sizeof(TcpHdr));
+    ip_hdr->check = 0;
     
     TcpHdr* tcp_hdr = reinterpret_cast<TcpHdr*>(packet.data() + sizeof(EthHdr) + sizeof(IpHdr));
     memcpy(tcp_hdr, &tcp_hdr_orig, sizeof(TcpHdr));
@@ -147,7 +143,7 @@ void PacketHandler::sendForwardRst(const EthHdr& eth_hdr_orig, const IpHdr& ip_h
     tcp_hdr->th_off = (sizeof(TcpHdr) / 4);
     tcp_hdr->th_sum = 0;
     
-    ip_hdr->checksum = calculateIpChecksum(ip_hdr);
+    ip_hdr->check = calculateIpChecksum(ip_hdr);
     tcp_hdr->th_sum = calculateTcpChecksum(ip_hdr, tcp_hdr, nullptr, 0);
 
     if (pcap_sendpacket(pcap_handle_, packet.data(), packet.size()) != 0) {
@@ -164,8 +160,9 @@ void PacketHandler::sendBackwardRst(const IpHdr& ip_hdr_orig, const TcpHdr& tcp_
     ip_hdr->sip_ = ip_hdr_orig.dip_;
     ip_hdr->dip_ = ip_hdr_orig.sip_;
     
-    ip_hdr->total_length = htons(packet_len);
-    ip_hdr->checksum = 0;
+    // 컴파일러 제안 이름으로 수정
+    ip_hdr->total_len = htons(packet_len);
+    ip_hdr->check = 0;
     
     TcpHdr* tcp_hdr = reinterpret_cast<TcpHdr*>(packet.data() + sizeof(IpHdr));
     memcpy(tcp_hdr, &tcp_hdr_orig, sizeof(TcpHdr));
@@ -176,7 +173,7 @@ void PacketHandler::sendBackwardRst(const IpHdr& ip_hdr_orig, const TcpHdr& tcp_
     tcp_hdr->th_off = (sizeof(TcpHdr) / 4);
     tcp_hdr->th_sum = 0;
 
-    ip_hdr->checksum = calculateIpChecksum(ip_hdr);
+    ip_hdr->check = calculateIpChecksum(ip_hdr);
     tcp_hdr->th_sum = calculateTcpChecksum(ip_hdr, tcp_hdr, nullptr, 0);
     
     int sock = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
@@ -220,7 +217,8 @@ uint16_t PacketHandler::calculateTcpChecksum(IpHdr* ip_hdr, TcpHdr* tcp_hdr, con
     sum += (ntohl(ip_hdr->dip_) >> 16) & 0xFFFF;
     sum += ntohl(ip_hdr->dip_) & 0xFFFF;
     
-    sum += htons(ip_hdr->protocol);
+    // 컴파일러 제안 이름으로 수정
+    sum += htons(ip_hdr->proto);
     size_t tcp_len = sizeof(TcpHdr) + data_len;
     sum += htons(tcp_len);
 
