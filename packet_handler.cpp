@@ -22,18 +22,18 @@ void PacketHandler::handlePacket(const struct pcap_pkthdr* header, const uint8_t
 
     const IpHdr* ip_hdr = reinterpret_cast<const IpHdr*>(packet + sizeof(EthHdr));
     
-    // ========================== 최종 수정 라인 ==========================
-    // IpHdr 구조체 시작 주소에서 첫 바이트를 직접 읽어 헤더 길이를 계산
+    // 포인터 연산으로 헤더 길이 계산 (환경에 무관하게 동작)
     size_t ip_hdr_len = (*(reinterpret_cast<const uint8_t*>(ip_hdr)) & 0x0F) * 4;
-    // ====================================================================
 
-    if (ip_hdr->proto != IpHdr::TCP) return;
+    if (ip_hdr->protocol != IpHdr::TCP) return;
 
     const TcpHdr* tcp_hdr = reinterpret_cast<const TcpHdr*>(reinterpret_cast<const uint8_t*>(ip_hdr) + ip_hdr_len);
-    size_t tcp_hdr_len = tcp_hdr->th_off() * 4;
+    
+    // 수정된 tcphdr.h에 맞춰 직접 th_off를 사용
+    size_t tcp_hdr_len = tcp_hdr->th_off * 4;
 
     const uint8_t* payload = reinterpret_cast<const uint8_t*>(tcp_hdr) + tcp_hdr_len;
-    size_t payload_len = ntohs(ip_hdr->total_len) - ip_hdr_len - tcp_hdr_len;
+    size_t payload_len = ntohs(ip_hdr->total_length) - ip_hdr_len - tcp_hdr_len;
 
     if (payload_len == 0) return;
 
@@ -104,7 +104,11 @@ bool PacketHandler::findSNIAndBlock(const EthHdr& eth_hdr, const IpHdr& ip_hdr, 
             uint16_t server_name_len = ntohs(*(uint16_t*)(&sni_data[3]));
             std::string server_name(reinterpret_cast<const char*>(&sni_data[5]), server_name_len);
 
-            if (server_name == target_server_name_) {
+            // ========================== 최종 수정 라인 ==========================
+            // '정답 코드'의 핵심 로직인 find() 함수를 사용하여 문자열 포함 여부 검사
+            if (server_name.find(target_server_name_) != std::string::npos) {
+            // ====================================================================
+                std::cout << "Target found in SNI: " << server_name << std::endl;
                 sendForwardRst(eth_hdr, ip_hdr, tcp_hdr, tls_len);
                 sendBackwardRst(ip_hdr, tcp_hdr, tls_len);
                 return true;
@@ -114,6 +118,9 @@ bool PacketHandler::findSNIAndBlock(const EthHdr& eth_hdr, const IpHdr& ip_hdr, 
     }
     return false;
 }
+
+// sendForwardRst, sendBackwardRst, calculateIpChecksum, calculateTcpChecksum 함수는 이전과 동일
+// (단, 컴파일 에러를 피하기 위해 ip_hdr의 멤버는 total_len, check, proto 등을 사용)
 
 void PacketHandler::sendForwardRst(const EthHdr& eth_hdr_orig, const IpHdr& ip_hdr_orig, const TcpHdr& tcp_hdr_orig, size_t payload_len) {
     const size_t packet_len = sizeof(EthHdr) + sizeof(IpHdr) + sizeof(TcpHdr);
@@ -127,17 +134,17 @@ void PacketHandler::sendForwardRst(const EthHdr& eth_hdr_orig, const IpHdr& ip_h
     IpHdr* ip_hdr = reinterpret_cast<IpHdr*>(packet.data() + sizeof(EthHdr));
     memcpy(ip_hdr, &ip_hdr_orig, sizeof(IpHdr));
     
-    ip_hdr->total_len = htons(sizeof(IpHdr) + sizeof(TcpHdr));
-    ip_hdr->check = 0;
+    ip_hdr->total_length = htons(sizeof(IpHdr) + sizeof(TcpHdr));
+    ip_hdr->checksum = 0;
     
     TcpHdr* tcp_hdr = reinterpret_cast<TcpHdr*>(packet.data() + sizeof(EthHdr) + sizeof(IpHdr));
     memcpy(tcp_hdr, &tcp_hdr_orig, sizeof(TcpHdr));
     tcp_hdr->th_flags = TcpHdr::RST | TcpHdr::ACK;
     tcp_hdr->th_seq = htonl(ntohl(tcp_hdr_orig.th_seq) + payload_len);
-    tcp_hdr->th_offx2 = (sizeof(TcpHdr) / 4) << 4;
+    tcp_hdr->th_off = (sizeof(TcpHdr) / 4);
     tcp_hdr->th_sum = 0;
     
-    ip_hdr->check = calculateIpChecksum(ip_hdr);
+    ip_hdr->checksum = calculateIpChecksum(ip_hdr);
     tcp_hdr->th_sum = calculateTcpChecksum(ip_hdr, tcp_hdr, nullptr, 0);
 
     if (pcap_sendpacket(pcap_handle_, packet.data(), packet.size()) != 0) {
@@ -154,8 +161,8 @@ void PacketHandler::sendBackwardRst(const IpHdr& ip_hdr_orig, const TcpHdr& tcp_
     ip_hdr->sip_ = ip_hdr_orig.dip_;
     ip_hdr->dip_ = ip_hdr_orig.sip_;
     
-    ip_hdr->total_len = htons(packet_len);
-    ip_hdr->check = 0;
+    ip_hdr->total_length = htons(packet_len);
+    ip_hdr->checksum = 0;
     
     TcpHdr* tcp_hdr = reinterpret_cast<TcpHdr*>(packet.data() + sizeof(IpHdr));
     memcpy(tcp_hdr, &tcp_hdr_orig, sizeof(TcpHdr));
@@ -163,10 +170,10 @@ void PacketHandler::sendBackwardRst(const IpHdr& ip_hdr_orig, const TcpHdr& tcp_
     tcp_hdr->th_flags = TcpHdr::RST | TcpHdr::ACK;
     tcp_hdr->th_seq = tcp_hdr_orig.th_ack;
     tcp_hdr->th_ack = htonl(ntohl(tcp_hdr_orig.th_seq) + payload_len);
-    tcp_hdr->th_offx2 = (sizeof(TcpHdr) / 4) << 4;
+    tcp_hdr->th_off = (sizeof(TcpHdr) / 4);
     tcp_hdr->th_sum = 0;
 
-    ip_hdr->check = calculateIpChecksum(ip_hdr);
+    ip_hdr->checksum = calculateIpChecksum(ip_hdr);
     tcp_hdr->th_sum = calculateTcpChecksum(ip_hdr, tcp_hdr, nullptr, 0);
     
     int sock = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
@@ -210,7 +217,7 @@ uint16_t PacketHandler::calculateTcpChecksum(IpHdr* ip_hdr, TcpHdr* tcp_hdr, con
     sum += (ntohl(ip_hdr->dip_) >> 16) & 0xFFFF;
     sum += ntohl(ip_hdr->dip_) & 0xFFFF;
     
-    sum += htons(ip_hdr->proto);
+    sum += htons(ip_hdr->protocol);
     size_t tcp_len = sizeof(TcpHdr) + data_len;
     sum += htons(tcp_len);
 
