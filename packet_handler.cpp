@@ -22,8 +22,11 @@ void PacketHandler::handlePacket(const struct pcap_pkthdr* header, const uint8_t
 
     const IpHdr* ip_hdr = reinterpret_cast<const IpHdr*>(packet + sizeof(EthHdr));
     
-    // 에러 수정: 컴파일러가 인식하는 이름으로 변경 (가장 흔한 시스템 헤더 기준)
-    size_t ip_hdr_len = ip_hdr->ihl * 4;
+    // ========================== 최종 수정 라인 ==========================
+    // IpHdr 구조체 시작 주소에서 첫 바이트를 직접 읽어 헤더 길이를 계산
+    size_t ip_hdr_len = (*(reinterpret_cast<const uint8_t*>(ip_hdr)) & 0x0F) * 4;
+    // ====================================================================
+
     if (ip_hdr->proto != IpHdr::TCP) return;
 
     const TcpHdr* tcp_hdr = reinterpret_cast<const TcpHdr*>(reinterpret_cast<const uint8_t*>(ip_hdr) + ip_hdr_len);
@@ -58,21 +61,18 @@ void PacketHandler::handlePacket(const struct pcap_pkthdr* header, const uint8_t
         stream.data.insert(stream.data.end(), payload, payload + payload_len);
 
         if (stream.data.size() >= expected_tls_len) {
-            // 수정된 함수 호출
             if (findSNIAndBlock(stream.eth_hdr, stream.ip_hdr, stream.tcp_hdr, stream.data.data(), stream.data.size())) {
                 std::cout << "Blocked segmented connection to " << target_server_name_ << std::endl;
             }
             active_streams_.erase(flow);
         }
     } else {
-        // 수정된 함수 호출
         if (findSNIAndBlock(*eth_hdr, *ip_hdr, *tcp_hdr, payload, payload_len)) {
             std::cout << "Blocked single-packet connection to " << target_server_name_ << std::endl;
         }
     }
 }
 
-// 함수 시그니처 수정 및 로직 개선
 bool PacketHandler::findSNIAndBlock(const EthHdr& eth_hdr, const IpHdr& ip_hdr, const TcpHdr& tcp_hdr, const uint8_t* tls_data, size_t tls_len) {
     size_t offset = sizeof(TlsHdr) + sizeof(HandshakeHdr) + 38;
 
@@ -105,7 +105,6 @@ bool PacketHandler::findSNIAndBlock(const EthHdr& eth_hdr, const IpHdr& ip_hdr, 
             std::string server_name(reinterpret_cast<const char*>(&sni_data[5]), server_name_len);
 
             if (server_name == target_server_name_) {
-                // 더 이상 맵을 찾을 필요 없이, 인자로 받은 헤더를 사용
                 sendForwardRst(eth_hdr, ip_hdr, tcp_hdr, tls_len);
                 sendBackwardRst(ip_hdr, tcp_hdr, tls_len);
                 return true;
@@ -128,7 +127,6 @@ void PacketHandler::sendForwardRst(const EthHdr& eth_hdr_orig, const IpHdr& ip_h
     IpHdr* ip_hdr = reinterpret_cast<IpHdr*>(packet.data() + sizeof(EthHdr));
     memcpy(ip_hdr, &ip_hdr_orig, sizeof(IpHdr));
     
-    // 에러 수정: 컴파일러 제안 이름으로 변경
     ip_hdr->total_len = htons(sizeof(IpHdr) + sizeof(TcpHdr));
     ip_hdr->check = 0;
     
@@ -156,7 +154,6 @@ void PacketHandler::sendBackwardRst(const IpHdr& ip_hdr_orig, const TcpHdr& tcp_
     ip_hdr->sip_ = ip_hdr_orig.dip_;
     ip_hdr->dip_ = ip_hdr_orig.sip_;
     
-    // 에러 수정: 컴파일러 제안 이름으로 변경
     ip_hdr->total_len = htons(packet_len);
     ip_hdr->check = 0;
     
@@ -213,7 +210,6 @@ uint16_t PacketHandler::calculateTcpChecksum(IpHdr* ip_hdr, TcpHdr* tcp_hdr, con
     sum += (ntohl(ip_hdr->dip_) >> 16) & 0xFFFF;
     sum += ntohl(ip_hdr->dip_) & 0xFFFF;
     
-    // 에러 수정: 컴파일러 제안 이름으로 변경
     sum += htons(ip_hdr->proto);
     size_t tcp_len = sizeof(TcpHdr) + data_len;
     sum += htons(tcp_len);
