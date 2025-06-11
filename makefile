@@ -1,6 +1,6 @@
 CXX = g++
-CXXFLAGS = -Wall -O2 -std=c++11
-LDFLAGS = -lpcap
+CXXFLAGS = -Wall -O2 -std=c++11 -pthread
+LDFLAGS = -lpcap -pthread
 
 TARGET = tls-block
 SRCS = tls-block.cpp
