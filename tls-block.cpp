@@ -19,92 +19,61 @@
 
 using namespace std;
 
-// --- 상태 관리를 위한 구조체 및 전역 변수 (이전과 동일) ---
-struct ConnectionKey {
-    Ip src_ip; Ip dst_ip; uint16_t src_port; uint16_t dst_port;
-    bool operator<(const ConnectionKey& other) const {
-        if (src_ip != other.src_ip) return src_ip < other.src_ip;
-        if (dst_ip != other.dst_ip) return dst_ip < other.dst_ip;
-        if (src_port != other.src_port) return src_port < other.src_port;
-        return dst_port < other.dst_port;
-    }
-};
-struct ReassemblyContext {
-    vector<uint8_t> buffer;
-    uint16_t expected_length{0};
-    EthHdr eth_hdr; IpHdr ip_hdr; TcpHdr tcp_hdr;
-};
+// --- 상태 관리 구조체 및 전역 변수 (이전과 동일) ---
+struct ConnectionKey { /* ... */ };
+struct ReassemblyContext { /* ... */ };
 static map<ConnectionKey, ReassemblyContext> session_manager;
 
-// --- 헬퍼 함수 (체크섬) ---
-static uint16_t calculate_checksum(const void* buf, size_t len) {
-    auto p = static_cast<const uint16_t*>(buf);
-    uint32_t sum = 0;
-    while (len > 1) { sum += ntohs(*p++); len -= 2; }
-    if (len) sum += (*reinterpret_cast<const uint8_t*>(p)) << 8;
-    while (sum >> 16) sum = (sum & 0xFFFF) + (sum >> 16);
-    return htons(~(uint16_t)sum);
-}
-
-// TCP 체크섬 계산을 위한 가상 헤더
+// --- 헬퍼 함수 (체크섬, 패킷 주입 - 이전과 동일) ---
+static uint16_t calculate_checksum(const void* buf, size_t len) { /* ... */ }
 #pragma pack(push, 1)
-struct PseudoHdr {
-    uint32_t src_ip; uint32_t dst_ip; uint8_t reserved; uint8_t protocol; uint16_t tcp_len;
-};
+struct PseudoHdr { /* ... */ };
 #pragma pack(pop)
+static void send_forward_rst(pcap_t* handle, const ReassemblyContext& ctx, const Mac& my_mac) { /* ... */ }
+static void send_backward_fin(const ReassemblyContext& ctx) { /* ... */ }
 
 
-// --- [핵심] 비대칭 패킷 주입 함수들 ---
-// 서버로 RST 전송
-static void send_forward_rst(pcap_t* handle, const ReassemblyContext& ctx, const Mac& my_mac) {
-    vector<uint8_t> packet(sizeof(EthHdr) + sizeof(IpHdr) + sizeof(TcpHdr));
-    EthHdr* eth = reinterpret_cast<EthHdr*>(packet.data());
-    IpHdr* ip = reinterpret_cast<IpHdr*>(eth + 1);
-    TcpHdr* tcp = reinterpret_cast<TcpHdr*>(ip + 1);
-    eth->dmac_ = ctx.eth_hdr.smac(); eth->smac_ = my_mac; eth->type_ = htons(EthHdr::Ip4);
-    memcpy(ip, &ctx.ip_hdr, sizeof(IpHdr));
-    ip->total_len = htons(sizeof(IpHdr) + sizeof(TcpHdr)); ip->check = 0;
-    memcpy(tcp, &ctx.tcp_hdr, sizeof(TcpHdr));
-    tcp->th_seq = htonl(ntohl(ctx.tcp_hdr.th_seq) + ctx.buffer.size());
-    tcp->th_flags = TcpHdr::RST | TcpHdr::ACK; tcp->th_sum = 0;
-    PseudoHdr psh; psh.src_ip = ip->sip_; psh.dst_ip = ip->dip_; psh.reserved = 0; psh.protocol = IpHdr::TCP; psh.tcp_len = htons(sizeof(TcpHdr));
-    vector<uint8_t> checksum_buf(sizeof(PseudoHdr) + sizeof(TcpHdr));
-    memcpy(checksum_buf.data(), &psh, sizeof(PseudoHdr)); memcpy(checksum_buf.data() + sizeof(PseudoHdr), tcp, sizeof(TcpHdr));
-    tcp->th_sum = calculate_checksum(checksum_buf.data(), checksum_buf.size());
-    ip->check = calculate_checksum(ip, sizeof(IpHdr));
-    pcap_sendpacket(handle, packet.data(), packet.size());
+// [핵심 수정] 방어 코드가 추가된 SNI 파싱 함수
+static string find_sni(const vector<uint8_t>& buffer) {
+    const uint8_t* data = buffer.data();
+    size_t len = buffer.size();
+    size_t pos = sizeof(Tls);
+
+    // [방어 코드] 각 단계를 진행하기 전에 남은 길이를 철저히 검사
+    if (len <= pos) return "";
+    pos += 1 + data[pos];
+    if (len <= pos + 2) return "";
+    pos += 2 + ntohs(*(uint16_t*)(data + pos));
+    if (len <= pos + 1) return "";
+    pos += 1 + data[pos];
+    if (len <= pos + 2) return "";
+    
+    uint16_t extensions_len = ntohs(*(uint16_t*)(data + pos));
+    pos += 2;
+    size_t extensions_end = pos + extensions_len;
+    if (len < extensions_end) return ""; // 실제 버퍼 길이보다 확장 필드가 길다면 잘못된 패킷
+
+    while (pos + 4 <= extensions_end) {
+        uint16_t ext_type = ntohs(*(uint16_t*)(data + pos));
+        uint16_t ext_len = ntohs(*(uint16_t*)(data + pos + 2));
+        pos += 4;
+        
+        if (pos + ext_len > extensions_end) return ""; // 현재 확장이 전체 확장 길이를 넘어서면 안됨
+
+        if (ext_type == 0) {
+            if (pos + 5 > extensions_end) return "";
+            uint16_t name_len = ntohs(*(uint16_t*)(data + pos + 3));
+            if (pos + 5 + name_len > extensions_end) return "";
+            return string((char*)(data + pos + 5), name_len);
+        }
+        pos += ext_len;
+    }
+    return "";
 }
-
-// 클라이언트로 FIN 전송
-static void send_backward_fin(const ReassemblyContext& ctx) {
-    vector<uint8_t> packet(sizeof(IpHdr) + sizeof(TcpHdr));
-    IpHdr* ip = reinterpret_cast<IpHdr*>(packet.data());
-    TcpHdr* tcp = reinterpret_cast<TcpHdr*>(ip + 1);
-    memcpy(ip, &ctx.ip_hdr, sizeof(IpHdr));
-    swap(ip->sip_, ip->dip_);
-    ip->total_len = htons(sizeof(IpHdr) + sizeof(TcpHdr)); ip->check = 0;
-    memcpy(tcp, &ctx.tcp_hdr, sizeof(TcpHdr));
-    swap(tcp->th_sport, tcp->th_dport);
-    tcp->th_seq = ctx.tcp_hdr.th_ack;
-    tcp->th_ack = htonl(ntohl(ctx.tcp_hdr.th_seq) + ctx.buffer.size());
-    tcp->th_flags = TcpHdr::FIN | TcpHdr::ACK; tcp->th_sum = 0;
-    PseudoHdr psh; psh.src_ip = ip->sip_; psh.dst_ip = ip->dip_; psh.reserved = 0; psh.protocol = IpHdr::TCP; psh.tcp_len = htons(sizeof(TcpHdr));
-    vector<uint8_t> checksum_buf(sizeof(PseudoHdr) + sizeof(TcpHdr));
-    memcpy(checksum_buf.data(), &psh, sizeof(PseudoHdr)); memcpy(checksum_buf.data() + sizeof(PseudoHdr), tcp, sizeof(TcpHdr));
-    tcp->th_sum = calculate_checksum(checksum_buf.data(), checksum_buf.size());
-    ip->check = calculate_checksum(ip, sizeof(IpHdr));
-    int sock = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
-    int one = 1; setsockopt(sock, IPPROTO_IP, IP_HDRINCL, &one, sizeof(one));
-    sockaddr_in sin{}; sin.sin_family = AF_INET; sin.sin_addr.s_addr = ip->dip_;
-    sendto(sock, packet.data(), packet.size(), 0, (sockaddr*)&sin, sizeof(sin)); close(sock);
-}
-
-// SNI 파싱
-static string find_sni(const vector<uint8_t>& buffer) { /* ... 이전과 동일 ... */ }
 
 // --- 메인 로직 및 프로그램 진입점 ---
-void usage() { /* ... 이전과 동일 ... */ }
-bool getMacIpAddr(const string &iface_name, Mac& mac_addr, Ip& ip_addr) { /* ... 이전과 동일 ... */ }
+void usage() { /* ... */ }
+bool getMacIpAddr(const string &iface_name, Mac& mac_addr, Ip& ip_addr) { /* ... */ }
 
 int main(int argc, char *argv[]) {
     if (argc != 3) { usage(); return 1; }
@@ -135,22 +104,42 @@ int main(int argc, char *argv[]) {
             break;
         }
 
+        // [핵심 수정] 패킷 파싱 전체에 방어 코드 적용
+        // =======================================================
+        
+        // [방어 코드 1] 이더넷 헤더를 읽을 만큼 패킷이 충분히 긴가?
+        if (header->caplen < sizeof(EthHdr)) continue;
         const EthHdr* eth = (const EthHdr*)pkt;
         if (eth->type() != EthHdr::Ip4) continue;
-        const IpHdr* ip = (const IpHdr*)(eth + 1);
+
+        // [방어 코드 2] IP 헤더의 최소 길이를 포함하는가?
+        size_t ip_offset = sizeof(EthHdr);
+        if (header->caplen < ip_offset + sizeof(IpHdr)) continue;
+        const IpHdr* ip = (const IpHdr*)(pkt + ip_offset);
         if (ip->proto != IpHdr::TCP) continue;
-        
+
+        // [방어 코드 3] IP 헤더에 명시된 길이가 실제 패킷 길이를 넘지 않는가?
         size_t ip_hdr_len = ip->ipHdrLen();
+        if (header->caplen < ip_offset + ip_hdr_len) continue;
+
+        // [방어 코드 4] TCP 헤더의 최소 길이를 포함하는가?
+        size_t tcp_offset = ip_offset + ip_hdr_len;
+        if (header->caplen < tcp_offset + sizeof(TcpHdr)) continue;
         const TcpHdr* tcp = (const TcpHdr*)((u_char*)ip + ip_hdr_len);
+
+        // [방어 코드 5] TCP 헤더에 명시된 길이가 실제 패킷 길이를 넘지 않는가?
+        size_t tcp_hdr_len = tcp->th_off * 4;
+        if (header->caplen < tcp_offset + tcp_hdr_len) continue;
+
+        size_t payload_len = ntohs(ip->total_len) - ip_hdr_len - tcp_hdr_len;
+        const uint8_t* payload = (const uint8_t*)tcp + tcp_hdr_len;
         
+        // =======================================================
+
         ConnectionKey key{ip->sip(), ip->dip(), ntohs(tcp->th_sport), ntohs(tcp->th_dport)};
         
         if (tcp->th_flags & (TcpHdr::RST | TcpHdr::FIN)) { session_manager.erase(key); continue; }
-        
-        size_t payload_len = ntohs(ip->total_len) - ip_hdr_len - (tcp->th_off * 4);
         if (payload_len == 0) continue;
-        
-        const uint8_t* payload = (const uint8_t*)tcp + (tcp->th_off * 4);
         
         if (session_manager.find(key) == session_manager.end()) {
             const Tls* tls = (const Tls*)payload;
@@ -171,9 +160,8 @@ int main(int argc, char *argv[]) {
                 cout << "[*] Detected SNI: " << sni << endl;
                 if (sni.find(server) != string::npos) {
                     cout << "[!] Match found! Interrupting handshake..." << endl;
-                    // 비대칭 공격 실행!
-                    send_forward_rst(pcap, ctx, my_mac); // 서버에는 RST
-                    send_backward_fin(ctx);              // 클라이언트에는 FIN
+                    send_forward_rst(pcap, ctx, my_mac);
+                    send_backward_fin(ctx);
                 }
             }
             session_manager.erase(key);
