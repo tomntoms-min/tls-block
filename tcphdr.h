@@ -1,33 +1,30 @@
 #pragma once
 
-#include <netinet/in.h>
+#include <cstdint>
+#include <arpa/inet.h>
 
 #pragma pack(push, 1)
+struct TcpHdr {
+    uint16_t th_sport;
+    uint16_t th_dport;
+    uint32_t th_seq;
+    uint32_t th_ack;
+    uint8_t  th_offx2;
+    uint8_t  th_flags;
+    uint16_t th_win;
+    uint16_t th_sum;
+    uint16_t th_urp;
 
-struct TcpHdr final
-{
-    uint16_t th_sport;       /* source port */
-    uint16_t th_dport;       /* destination port */
-    uint32_t th_seq;          /* sequence number */
-    uint32_t th_ack;          /* acknowledgement number */
+    uint8_t th_off() const { return (th_offx2 & 0xF0) >> 4; }
 
-    uint8_t th_x2:4,         /* (unused) */
-           th_off:4;        /* data offset */
-
-    uint8_t  th_flags;       /* control flags */
-
-    uint16_t th_win;         /* window */
-    uint16_t th_sum;         /* checksum */
-    uint16_t th_urp;         /* urgent pointer */
-
-    enum: u_int8_t {
+    enum: uint8_t {
         FIN = 0x01,
         SYN = 0x02,
         RST = 0x04,
         PSH = 0x08,
         ACK = 0x10,
-        URG = 0x20
+        URG = 0x20,
     };
 };
-
+typedef TcpHdr *pTcpHdr;
 #pragma pack(pop)
