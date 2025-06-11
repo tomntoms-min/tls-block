@@ -4,7 +4,7 @@
 #include <vector>
 #include <netinet/in.h>
 #include <sys/socket.h>
-#include <unistd.h> // close() 함수를 위해 이 헤더를 추가합니다.
+#include <unistd.h>
 
 // '새로운 정답 코드'의 강력한 체크섬 계산 방식을 도입합니다.
 uint16_t PacketHandler::calculateChecksum(uint16_t *buf, int nbytes) {
@@ -53,7 +53,6 @@ void PacketHandler::handlePacket(const struct pcap_pkthdr* header, const uint8_t
 }
 
 std::string PacketHandler::parseSNI(const uint8_t* payload, int len) {
-    // Record Layer(5) + Handshake Header(4)
     if (len < 9 || payload[5] != 0x01) return ""; 
     
     int offset = 5 + 4; 
