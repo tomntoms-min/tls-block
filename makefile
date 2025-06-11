@@ -1,9 +1,10 @@
 CXX = g++
-CXXFLAGS = -Wall -O2 -std=c++11 -pthread
-LDFLAGS = -lpcap -pthread
-
+CXXFLAGS = -Wall -O2 -std=c++11
+LDFLAGS = -lpcap
 TARGET = tls-block
-SRCS = tls-block.cpp
+
+# ip.cpp와 mac.cpp를 컴파일 대상에 추가
+SRCS = tls-block.cpp ip.cpp mac.cpp
 
 all: $(TARGET)
 
