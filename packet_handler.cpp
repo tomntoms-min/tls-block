@@ -22,18 +22,14 @@ void PacketHandler::handlePacket(const struct pcap_pkthdr* header, const uint8_t
 
     const IpHdr* ip_hdr = reinterpret_cast<const IpHdr*>(packet + sizeof(EthHdr));
     
-    // 1. 이름 충돌을 피하기 위해 포인터로 직접 헤더 길이 계산
     size_t ip_hdr_len = (*(reinterpret_cast<const uint8_t*>(ip_hdr)) & 0x0F) * 4;
-
-    // 2. 컴파일러 제안에 따라 'protocol' -> 'proto' 로 수정
-    if (ip_hdr->proto != IpHdr::TCP) return;
+    if (ip_hdr->protocol != IpHdr::TCP) return;
 
     const TcpHdr* tcp_hdr = reinterpret_cast<const TcpHdr*>(reinterpret_cast<const uint8_t*>(ip_hdr) + ip_hdr_len);
     size_t tcp_hdr_len = tcp_hdr->th_off * 4;
 
     const uint8_t* payload = reinterpret_cast<const uint8_t*>(tcp_hdr) + tcp_hdr_len;
-    // 3. 컴파일러 제안에 따라 'total_length' -> 'total_len' 로 수정
-    size_t payload_len = ntohs(ip_hdr->total_len) - ip_hdr_len - tcp_hdr_len;
+    size_t payload_len = ntohs(ip_hdr->total_length) - ip_hdr_len - tcp_hdr_len;
 
     if (payload_len < (sizeof(TlsHdr) + sizeof(HandshakeHdr))) return;
     
@@ -74,7 +70,7 @@ bool PacketHandler::findSNIAndBlock(const EthHdr& eth_hdr, const IpHdr& ip_hdr, 
     const uint8_t* p = tls_data + sizeof(TlsHdr) + sizeof(HandshakeHdr);
     const uint8_t* end = tls_data + tls_len; 
 
-    p += 34; // Client Version (2) + Client Random (32)
+    p += 34;
 
     if (p + 1 > end) return false;
     uint8_t session_id_len = *p;
@@ -132,9 +128,8 @@ void PacketHandler::sendForwardRst(const EthHdr& eth_hdr_orig, const IpHdr& ip_h
     IpHdr* ip_hdr = reinterpret_cast<IpHdr*>(packet.data() + sizeof(EthHdr));
     memcpy(ip_hdr, &ip_hdr_orig, sizeof(IpHdr));
     
-    // 컴파일러 제안 이름으로 수정
-    ip_hdr->total_len = htons(sizeof(IpHdr) + sizeof(TcpHdr));
-    ip_hdr->check = 0;
+    ip_hdr->total_length = htons(sizeof(IpHdr) + sizeof(TcpHdr));
+    ip_hdr->checksum = 0;
     
     TcpHdr* tcp_hdr = reinterpret_cast<TcpHdr*>(packet.data() + sizeof(EthHdr) + sizeof(IpHdr));
     memcpy(tcp_hdr, &tcp_hdr_orig, sizeof(TcpHdr));
@@ -143,7 +138,7 @@ void PacketHandler::sendForwardRst(const EthHdr& eth_hdr_orig, const IpHdr& ip_h
     tcp_hdr->th_off = (sizeof(TcpHdr) / 4);
     tcp_hdr->th_sum = 0;
     
-    ip_hdr->check = calculateIpChecksum(ip_hdr);
+    ip_hdr->checksum = calculateIpChecksum(ip_hdr);
     tcp_hdr->th_sum = calculateTcpChecksum(ip_hdr, tcp_hdr, nullptr, 0);
 
     if (pcap_sendpacket(pcap_handle_, packet.data(), packet.size()) != 0) {
@@ -160,9 +155,8 @@ void PacketHandler::sendBackwardRst(const IpHdr& ip_hdr_orig, const TcpHdr& tcp_
     ip_hdr->sip_ = ip_hdr_orig.dip_;
     ip_hdr->dip_ = ip_hdr_orig.sip_;
     
-    // 컴파일러 제안 이름으로 수정
-    ip_hdr->total_len = htons(packet_len);
-    ip_hdr->check = 0;
+    ip_hdr->total_length = htons(packet_len);
+    ip_hdr->checksum = 0;
     
     TcpHdr* tcp_hdr = reinterpret_cast<TcpHdr*>(packet.data() + sizeof(IpHdr));
     memcpy(tcp_hdr, &tcp_hdr_orig, sizeof(TcpHdr));
@@ -173,7 +167,7 @@ void PacketHandler::sendBackwardRst(const IpHdr& ip_hdr_orig, const TcpHdr& tcp_
     tcp_hdr->th_off = (sizeof(TcpHdr) / 4);
     tcp_hdr->th_sum = 0;
 
-    ip_hdr->check = calculateIpChecksum(ip_hdr);
+    ip_hdr->checksum = calculateIpChecksum(ip_hdr);
     tcp_hdr->th_sum = calculateTcpChecksum(ip_hdr, tcp_hdr, nullptr, 0);
     
     int sock = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
@@ -190,6 +184,9 @@ void PacketHandler::sendBackwardRst(const IpHdr& ip_hdr_orig, const TcpHdr& tcp_
 
     struct sockaddr_in sin;
     sin.sin_family = AF_INET;
+    // ========================== 최종 버그 수정 라인 ==========================
+    sin.sin_port = tcp_hdr->th_dport; // 목적지 포트 번호를 명시적으로 지정
+    // ====================================================================
     sin.sin_addr.s_addr = ip_hdr->dip_;
 
     if (sendto(sock, packet.data(), packet.size(), 0, (struct sockaddr*)&sin, sizeof(sin)) < 0) {
@@ -217,8 +214,7 @@ uint16_t PacketHandler::calculateTcpChecksum(IpHdr* ip_hdr, TcpHdr* tcp_hdr, con
     sum += (ntohl(ip_hdr->dip_) >> 16) & 0xFFFF;
     sum += ntohl(ip_hdr->dip_) & 0xFFFF;
     
-    // 컴파일러 제안 이름으로 수정
-    sum += htons(ip_hdr->proto);
+    sum += htons(ip_hdr->protocol);
     size_t tcp_len = sizeof(TcpHdr) + data_len;
     sum += htons(tcp_len);
 
