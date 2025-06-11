@@ -51,17 +51,32 @@ int main(int argc, char* argv[]) {
     std::cout << "Blocking server pattern: " << server_name << std::endl;
 
     char errbuf[PCAP_ERRBUF_SIZE];
-    pcap_t* pcap = pcap_open_live(interface_name.c_str(), BUFSIZ, 1, 1, errbuf);
+    
+    // ================== 최종 수정: 올바른 pcap 초기화 순서 ==================
+    // 1. pcap 핸들 생성
+    pcap_t* pcap = pcap_create(interface_name.c_str(), errbuf);
     if (pcap == nullptr) {
-        std::cerr << "pcap_open_live failed: " << errbuf << std::endl;
+        std::cerr << "pcap_create() error: " << errbuf << std::endl;
         return -1;
     }
 
-    // ================== 속도 최적화 1: 즉시 모드 활성화 ==================
+    // 2. 세부 옵션 설정 (활성화 전에 해야 함)
+    pcap_set_snaplen(pcap, BUFSIZ);
+    pcap_set_promisc(pcap, 1);
+    pcap_set_timeout(pcap, 1);
+    
+    // 3. 즉시 모드 활성화 (가장 중요한 속도 최적화)
     if (pcap_set_immediate_mode(pcap, 1) != 0) {
         std::cerr << "pcap_set_immediate_mode error: " << pcap_geterr(pcap) << std::endl;
     }
-    // =================================================================
+
+    // 4. 모든 옵션 설정 후 핸들 활성화
+    if (pcap_activate(pcap) != 0) {
+        std::cerr << "pcap_activate() error: " << pcap_geterr(pcap) << std::endl;
+        pcap_close(pcap);
+        return -1;
+    }
+    // =====================================================================
 
     PacketHandler handler(pcap, my_mac, server_name);
 
