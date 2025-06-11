@@ -12,7 +12,6 @@ void usage() {
     std::cout << "sample : tls-block wlan0 naver.com\n";
 }
 
-// MAC 주소를 가져오는 함수
 bool getMyMacAddress(const std::string& iface, uint8_t* mac_addr) {
     struct ifreq ifr;
     int sock = socket(AF_INET, SOCK_DGRAM, 0);
@@ -20,14 +19,12 @@ bool getMyMacAddress(const std::string& iface, uint8_t* mac_addr) {
         perror("socket");
         return false;
     }
-
     strncpy(ifr.ifr_name, iface.c_str(), IFNAMSIZ);
     if (ioctl(sock, SIOCGIFHWADDR, &ifr) < 0) {
         perror("ioctl(mac)");
         close(sock);
         return false;
     }
-    
     memcpy(mac_addr, ifr.ifr_hwaddr.sa_data, 6);
     close(sock);
     return true;
@@ -44,7 +41,7 @@ int main(int argc, char* argv[]) {
     uint8_t my_mac[6];
 
     if (!getMyMacAddress(interface_name, my_mac)) {
-        std::cerr << "Failed to get MAC address for interface " << interface_name << std::endl;
+        std::cerr << "Failed to get MAC address for " << interface_name << std::endl;
         return -1;
     }
     
@@ -59,6 +56,12 @@ int main(int argc, char* argv[]) {
         std::cerr << "pcap_open_live failed: " << errbuf << std::endl;
         return -1;
     }
+
+    // ================== 속도 최적화 1: 즉시 모드 활성화 ==================
+    if (pcap_set_immediate_mode(pcap, 1) != 0) {
+        std::cerr << "pcap_set_immediate_mode error: " << pcap_geterr(pcap) << std::endl;
+    }
+    // =================================================================
 
     PacketHandler handler(pcap, my_mac, server_name);
 
