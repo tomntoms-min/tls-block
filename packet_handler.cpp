@@ -6,7 +6,6 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-// '새로운 정답 코드'의 강력한 체크섬 계산 방식을 도입합니다.
 uint16_t PacketHandler::calculateChecksum(uint16_t *buf, int nbytes) {
     unsigned long sum = 0;
     while (nbytes > 1) {
@@ -101,18 +100,18 @@ void PacketHandler::sendForwardRst(const uint8_t* orig_packet, const struct ip* 
     int tcp_sz = tcp_hdr->th_off * 4;
     int total_hdr_sz = eth_sz + ip_sz + tcp_sz;
     
-    std::vector<uint8_t> packet(total_hdr_sz);
-    memcpy(packet.data(), orig_packet, total_hdr_sz);
+    // 정적 버퍼 사용
+    memcpy(send_buf_, orig_packet, total_hdr_sz);
 
-    struct ether_header* eth = reinterpret_cast<struct ether_header*>(packet.data());
+    struct ether_header* eth = reinterpret_cast<struct ether_header*>(send_buf_);
     memcpy(eth->ether_shost, my_mac_, 6);
 
-    struct ip* new_ip = reinterpret_cast<struct ip*>(packet.data() + eth_sz);
+    struct ip* new_ip = reinterpret_cast<struct ip*>(send_buf_ + eth_sz);
     new_ip->ip_len = htons(ip_sz + tcp_sz);
     new_ip->ip_sum = 0;
     new_ip->ip_sum = htons(calculateChecksum(reinterpret_cast<uint16_t*>(new_ip), ip_sz));
 
-    struct tcphdr* new_tcp = reinterpret_cast<struct tcphdr*>(packet.data() + eth_sz + ip_sz);
+    struct tcphdr* new_tcp = reinterpret_cast<struct tcphdr*>(send_buf_ + eth_sz + ip_sz);
     new_tcp->th_seq = htonl(ntohl(tcp_hdr->th_seq) + payload_len);
     new_tcp->th_flags = TH_RST | TH_ACK;
     new_tcp->th_sum = 0;
@@ -127,7 +126,7 @@ void PacketHandler::sendForwardRst(const uint8_t* orig_packet, const struct ip* 
     memcpy(pseudo_packet.data() + 12, new_tcp, tcp_sz);
     new_tcp->th_sum = htons(calculateChecksum(reinterpret_cast<uint16_t*>(pseudo_packet.data()), pseudo_hdr_sz));
     
-    if (pcap_sendpacket(pcap_handle_, packet.data(), total_hdr_sz) != 0) {
+    if (pcap_sendpacket(pcap_handle_, send_buf_, total_hdr_sz) != 0) {
         fprintf(stderr, "pcap_sendpacket error: %s\n", pcap_geterr(pcap_handle_));
     }
 }
@@ -137,9 +136,10 @@ void PacketHandler::sendBackwardRst(const struct ip* ip_hdr, const struct tcphdr
     int tcp_sz = sizeof(struct tcphdr);
     int total_sz = ip_sz + tcp_sz;
 
-    std::vector<uint8_t> packet(total_sz, 0);
-
-    struct ip* new_ip = reinterpret_cast<struct ip*>(packet.data());
+    // 정적 버퍼 사용
+    memset(send_buf_, 0, total_sz);
+    
+    struct ip* new_ip = reinterpret_cast<struct ip*>(send_buf_);
     new_ip->ip_v = 4;
     new_ip->ip_hl = ip_sz / 4;
     new_ip->ip_len = htons(total_sz);
@@ -150,7 +150,7 @@ void PacketHandler::sendBackwardRst(const struct ip* ip_hdr, const struct tcphdr
     new_ip->ip_sum = 0;
     new_ip->ip_sum = htons(calculateChecksum(reinterpret_cast<uint16_t*>(new_ip), ip_sz));
 
-    struct tcphdr* new_tcp = reinterpret_cast<struct tcphdr*>(packet.data() + ip_sz);
+    struct tcphdr* new_tcp = reinterpret_cast<struct tcphdr*>(send_buf_ + ip_sz);
     new_tcp->th_sport = tcp_hdr->th_dport;
     new_tcp->th_dport = tcp_hdr->th_sport;
     new_tcp->th_seq = tcp_hdr->th_ack;
@@ -183,7 +183,7 @@ void PacketHandler::sendBackwardRst(const struct ip* ip_hdr, const struct tcphdr
     addr.sin_port = new_tcp->th_dport;
     addr.sin_addr = new_ip->ip_dst;
 
-    if (sendto(sd, packet.data(), total_sz, 0, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+    if (sendto(sd, send_buf_, total_sz, 0, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         perror("sendto");
     }
     close(sd);
