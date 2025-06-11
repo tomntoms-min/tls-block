@@ -76,8 +76,8 @@ string parse_sni(const u_char *data, int data_len) {
         pos += 4;
         if (ext_type == 0x00) {  // SNI
             if (pos + 5 >= data_len) return "";
-            uint16_t sni_list_len = (data[pos] << 8) | data[pos + 1];
-            uint8_t sni_type = data[pos + 2];
+            //uint16_t sni_list_len = (data[pos] << 8) | data[pos + 1];
+            //uint8_t sni_type = data[pos + 2];
             uint16_t sni_len = (data[pos + 3] << 8) | data[pos + 4];
             pos += 5;
             if (pos + sni_len > data_len) return "";
