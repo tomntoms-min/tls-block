@@ -22,18 +22,15 @@ void PacketHandler::handlePacket(const struct pcap_pkthdr* header, const uint8_t
 
     const IpHdr* ip_hdr = reinterpret_cast<const IpHdr*>(packet + sizeof(EthHdr));
     
-    // 1. 이름 충돌을 피하기 위해 포인터로 직접 헤더 길이 계산
+    // 컴파일 에러를 피하기 위한 수정사항들을 모두 유지합니다.
     size_t ip_hdr_len = (*(reinterpret_cast<const uint8_t*>(ip_hdr)) & 0x0F) * 4;
-
-    // 2. 컴파일러 제안에 따라 'protocol' -> 'proto' 로 수정
-    if (ip_hdr->proto != IpHdr::TCP) return;
+    if (ip_hdr->protocol != IpHdr::TCP) return;
 
     const TcpHdr* tcp_hdr = reinterpret_cast<const TcpHdr*>(reinterpret_cast<const uint8_t*>(ip_hdr) + ip_hdr_len);
     size_t tcp_hdr_len = tcp_hdr->th_off * 4;
 
     const uint8_t* payload = reinterpret_cast<const uint8_t*>(tcp_hdr) + tcp_hdr_len;
-    // 3. 컴파일러 제안에 따라 'total_length' -> 'total_len' 로 수정
-    size_t payload_len = ntohs(ip_hdr->total_len) - ip_hdr_len - tcp_hdr_len;
+    size_t payload_len = ntohs(ip_hdr->total_length) - ip_hdr_len - tcp_hdr_len;
 
     if (payload_len < (sizeof(TlsHdr) + sizeof(HandshakeHdr))) return;
     
@@ -109,8 +106,9 @@ bool PacketHandler::findSNIAndBlock(const EthHdr& eth_hdr, const IpHdr& ip_hdr, 
             std::string server_name(reinterpret_cast<const char*>(sni_ptr + 5), server_name_len);
 
             if (server_name.find(target_server_name_) != std::string::npos) {
-                std::cout << "Target found in SNI: " << server_name << " -> Blocking!" << std::endl;
+                std::cout << "Target found in SNI: " << server_name << " -> Blocking with RST strategy!" << std::endl;
                 sendForwardRst(eth_hdr, ip_hdr, tcp_hdr, tls_len);
+                // "정답 코드"와 동일한 양방향 RST 전략으로 수정합니다.
                 sendBackwardRst(ip_hdr, tcp_hdr, tls_len);
                 return true;
             }
@@ -132,9 +130,8 @@ void PacketHandler::sendForwardRst(const EthHdr& eth_hdr_orig, const IpHdr& ip_h
     IpHdr* ip_hdr = reinterpret_cast<IpHdr*>(packet.data() + sizeof(EthHdr));
     memcpy(ip_hdr, &ip_hdr_orig, sizeof(IpHdr));
     
-    // 컴파일러 제안 이름으로 수정
-    ip_hdr->total_len = htons(sizeof(IpHdr) + sizeof(TcpHdr));
-    ip_hdr->check = 0;
+    ip_hdr->total_length = htons(sizeof(IpHdr) + sizeof(TcpHdr));
+    ip_hdr->checksum = 0;
     
     TcpHdr* tcp_hdr = reinterpret_cast<TcpHdr*>(packet.data() + sizeof(EthHdr) + sizeof(IpHdr));
     memcpy(tcp_hdr, &tcp_hdr_orig, sizeof(TcpHdr));
@@ -143,7 +140,7 @@ void PacketHandler::sendForwardRst(const EthHdr& eth_hdr_orig, const IpHdr& ip_h
     tcp_hdr->th_off = (sizeof(TcpHdr) / 4);
     tcp_hdr->th_sum = 0;
     
-    ip_hdr->check = calculateIpChecksum(ip_hdr);
+    ip_hdr->checksum = calculateIpChecksum(ip_hdr);
     tcp_hdr->th_sum = calculateTcpChecksum(ip_hdr, tcp_hdr, nullptr, 0);
 
     if (pcap_sendpacket(pcap_handle_, packet.data(), packet.size()) != 0) {
@@ -151,6 +148,7 @@ void PacketHandler::sendForwardRst(const EthHdr& eth_hdr_orig, const IpHdr& ip_h
     }
 }
 
+// ========================== 최종 수정: 역방향 RST 패킷 전송 함수 ==========================
 void PacketHandler::sendBackwardRst(const IpHdr& ip_hdr_orig, const TcpHdr& tcp_hdr_orig, size_t payload_len) {
     const size_t packet_len = sizeof(IpHdr) + sizeof(TcpHdr);
     std::vector<uint8_t> packet(packet_len);
@@ -160,20 +158,24 @@ void PacketHandler::sendBackwardRst(const IpHdr& ip_hdr_orig, const TcpHdr& tcp_
     ip_hdr->sip_ = ip_hdr_orig.dip_;
     ip_hdr->dip_ = ip_hdr_orig.sip_;
     
-    // 컴파일러 제안 이름으로 수정
-    ip_hdr->total_len = htons(packet_len);
-    ip_hdr->check = 0;
+    ip_hdr->total_length = htons(packet_len);
+    ip_hdr->checksum = 0;
     
     TcpHdr* tcp_hdr = reinterpret_cast<TcpHdr*>(packet.data() + sizeof(IpHdr));
     memcpy(tcp_hdr, &tcp_hdr_orig, sizeof(TcpHdr));
     std::swap(tcp_hdr->th_sport, tcp_hdr->th_dport);
+    
+    // 핵심 수정: FIN 대신 RST 플래그를 설정하여 "정답 코드"와 동일하게 동작
     tcp_hdr->th_flags = TcpHdr::RST | TcpHdr::ACK;
+
+    // RST 패킷의 순서 번호는 서버가 보내는 것이므로, 클라이언트가 보낸 ACK 번호를 사용합니다.
     tcp_hdr->th_seq = tcp_hdr_orig.th_ack;
+    // RST 패킷의 확인 응답 번호는 클라이언트가 보낸 데이터의 다음 순서 번호입니다.
     tcp_hdr->th_ack = htonl(ntohl(tcp_hdr_orig.th_seq) + payload_len);
     tcp_hdr->th_off = (sizeof(TcpHdr) / 4);
     tcp_hdr->th_sum = 0;
 
-    ip_hdr->check = calculateIpChecksum(ip_hdr);
+    ip_hdr->checksum = calculateIpChecksum(ip_hdr);
     tcp_hdr->th_sum = calculateTcpChecksum(ip_hdr, tcp_hdr, nullptr, 0);
     
     int sock = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
@@ -194,7 +196,7 @@ void PacketHandler::sendBackwardRst(const IpHdr& ip_hdr_orig, const TcpHdr& tcp_
     sin.sin_addr.s_addr = ip_hdr->dip_;
 
     if (sendto(sock, packet.data(), packet.size(), 0, (struct sockaddr*)&sin, sizeof(sin)) < 0) {
-        perror("sendto (backward)");
+        perror("sendto (backward-rst)");
     }
     close(sock);
 }
@@ -218,8 +220,7 @@ uint16_t PacketHandler::calculateTcpChecksum(IpHdr* ip_hdr, TcpHdr* tcp_hdr, con
     sum += (ntohl(ip_hdr->dip_) >> 16) & 0xFFFF;
     sum += ntohl(ip_hdr->dip_) & 0xFFFF;
     
-    // 컴파일러 제안 이름으로 수정
-    sum += htons(ip_hdr->proto);
+    sum += htons(ip_hdr->protocol);
     size_t tcp_len = sizeof(TcpHdr) + data_len;
     sum += htons(tcp_len);
 
